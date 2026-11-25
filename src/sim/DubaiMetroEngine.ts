@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   DUBAI_STATIONS,
   StationDef,
@@ -15,6 +16,7 @@ import {
   createDubaiMetroTrain,
   createDubaiStation,
   createEmiratesTowers,
+  createHighwayGantry,
   createJebelAliPort,
   createMuseumOfFuture,
   createSkiDubaiDome,
@@ -24,9 +26,6 @@ import {
 import { createProceduralTextures, ProceduralTextureSet } from './textures';
 import {
   getSpeedLimitAt,
-  getTrackX,
-  getTrackY,
-  getTrackZ,
   sampleTrackPose,
   TrackPose,
 } from './track';
@@ -70,7 +69,6 @@ interface LandmarkPlacement {
   mesh: THREE.Group;
 }
 
-// Reusable scratch objects to prevent per-frame GC allocations
 const _dummy = new THREE.Object3D();
 const _pose: TrackPose = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
 const _poseNext: TrackPose = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
@@ -85,6 +83,22 @@ function seededRand(seed: number): number {
   return x - Math.floor(x);
 }
 
+function buildPalmCrownGeometry(): THREE.BufferGeometry {
+  const fronds: THREE.BufferGeometry[] = [];
+  const count = 7;
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2;
+    const blade = new THREE.ConeGeometry(0.65, 3.6, 5);
+    blade.rotateX(Math.PI * 0.42);
+    blade.translate(0, 0.2, 1.5);
+    blade.rotateY(angle);
+    fronds.push(blade);
+  }
+  const merged = mergeGeometries(fronds);
+  fronds.forEach((f) => f.dispose());
+  return merged || new THREE.ConeGeometry(3.2, 2.6, 7);
+}
+
 export class DubaiMetroEngine {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
@@ -94,29 +108,40 @@ export class DubaiMetroEngine {
   private textures: ProceduralTextureSet;
   private audio: MetroAudioEngine;
 
-  // Lighting & Atmosphere
+  // Lighting, Sky & Atmosphere
   private sunLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
   private fog: THREE.FogExp2;
+  private skyMat!: THREE.ShaderMaterial;
+  private skyDome!: THREE.Mesh;
   private currentTimeOfDay: TimeOfDay = 'sunset';
+
+  // Building Materials (adjusted dynamically per TimeOfDay)
+  private buildingMats: THREE.MeshStandardMaterial[] = [];
 
   // Train & AI Train
   private trainRig: TrainRig;
   private aiTrainRig: TrainRig;
   private aiTrainS = 1800;
+  private leverAnimAngle = 0;
+  private cabPitchSway = 0;
+  private lastDmiUpdateMs = 0;
 
   // Stations & Landmarks
   private stationRigs: StationRig[] = [];
   private landmarks: LandmarkPlacement[] = [];
 
   // Streamed Instanced Corridor Meshes
-  private readonly SEG_COUNT = 64; // 64 * 25m = 1600m visible corridor window
+  private readonly SEG_COUNT = 64;
   private readonly SEG_LEN = 25;
   private viaductDeckInst!: THREE.InstancedMesh;
+  private viaductParapetInst!: THREE.InstancedMesh;
   private viaductPierInst!: THREE.InstancedMesh;
-  private railLeftInst!: THREE.InstancedMesh;
-  private railRightInst!: THREE.InstancedMesh;
+  private trackBedLeftInst!: THREE.InstancedMesh;
+  private trackBedRightInst!: THREE.InstancedMesh;
+  private steelRailInst!: THREE.InstancedMesh;
   private highwayInst!: THREE.InstancedMesh;
+  private highwayMedianInst!: THREE.InstancedMesh;
   private streetLampInst!: THREE.InstancedMesh;
   private palmTrunkInst!: THREE.InstancedMesh;
   private palmCrownInst!: THREE.InstancedMesh;
@@ -127,21 +152,20 @@ export class DubaiMetroEngine {
   private desertGround!: THREE.Mesh;
   private gulfWater!: THREE.Mesh;
 
-  // Traffic state
   private trafficVehicles: { offsetS: number; laneX: number; speedMs: number }[] = [];
 
   // Simulation Physics & Game State
-  private distanceM = 0; // Start docked at R11 Centrepoint
+  private distanceM = 0;
   private velocityMs = 0;
-  private notch = 0; // -3..+3
+  private notch = 0;
   private passengersOnboard = 0;
   private totalPassengersServed = 0;
   private lastBoarded = 0;
   private lastAlighted = 0;
   private visitedStations = new Set<number>();
-  private nextStationIdx = 1; // Station 0 is Centrepoint where we start
-  private doorPhase: DoorPhase = 'open'; // Start with doors open at Centrepoint to board!
-  private doorOpenAmount = 1; // 0..1
+  private nextStationIdx = 1;
+  private doorPhase: DoorPhase = 'open';
+  private doorOpenAmount = 1;
   private boardingTimer = 0;
   private readonly BOARDING_DURATION = 3.8;
   private initialBoardingDone = false;
@@ -160,7 +184,6 @@ export class DubaiMetroEngine {
   private routeComplete = false;
   private autoDepartWait = 0;
 
-  // Loop & Listeners
   private frameId = 0;
   private lastTimeMs = performance.now();
   private disposed = false;
@@ -178,7 +201,6 @@ export class DubaiMetroEngine {
     this.onContextLostCb = onContextLost;
     this.audio = new MetroAudioEngine();
 
-    // Detect software WebGL cleanly without touching user agent
     this.isSoftwareGl = (() => {
       const gl = document.createElement('canvas').getContext('webgl2');
       if (!gl) return true;
@@ -208,24 +230,22 @@ export class DubaiMetroEngine {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.fog = new THREE.FogExp2(0xe2a97e, 0.00088);
+    this.fog = new THREE.FogExp2(0xe2a97e, 0.00078);
     this.scene.fog = this.fog;
     this.scene.background = new THREE.Color(0xe2a97e);
 
     this.camera = new THREE.PerspectiveCamera(
       62,
       (container.clientWidth || 1280) / (container.clientHeight || 720),
-      0.25,
-      2600
+      0.15,
+      2800
     );
 
-    // Studio Environment Reflection for metallic trains, glass towers, and gold shells
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
 
-    // Lighting Rig
-    this.hemiLight = new THREE.HemisphereLight(0x93c5fd, 0xd4a574, 0.85);
+    this.hemiLight = new THREE.HemisphereLight(0x93c5fd, 0xd4a574, 0.88);
     this.scene.add(this.hemiLight);
 
     this.sunLight = new THREE.DirectionalLight(0xffd7a8, 2.2);
@@ -249,30 +269,25 @@ export class DubaiMetroEngine {
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
     this.textures = createProceduralTextures(maxAniso);
 
-    // Build Ground & Gulf Water
+    this.initSkyDome();
     this.initGroundAndWater();
-
-    // Build Streamed Corridor InstancedMeshes
     this.initStreamedCorridor();
 
-    // Build Player Train & AI Oncoming Train
-    this.trainRig = createDubaiMetroTrain(false);
+    this.trainRig = createDubaiMetroTrain(false, maxAniso, this.isSoftwareGl);
     this.scene.add(this.trainRig.group);
 
-    this.aiTrainRig = createDubaiMetroTrain(true);
+    this.aiTrainRig = createDubaiMetroTrain(true, maxAniso, this.isSoftwareGl);
     this.scene.add(this.aiTrainRig.group);
 
-    // Build 12 Stations & Iconic Dubai Landmarks
     this.initStationsAndLandmarks(maxAniso);
+    this.syncTrainCockpitVisibility();
 
-    // Initial Centrepoint passenger boarding setup
     this.visitedStations.add(0);
     this.pendingBoardTarget = 118;
     this.pendingAlightTarget = 0;
 
     this.setTimeOfDay('sunset');
 
-    // WebGL Context Loss Resilience
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
     this.renderer.domElement.addEventListener('webglcontextrestored', this.handleContextRestored);
     window.addEventListener('resize', this.handleResize);
@@ -281,10 +296,69 @@ export class DubaiMetroEngine {
       this.renderer.compile(this.scene, this.camera);
     }
 
-    // Immediate first frame update
     this.updateSceneTransforms(0);
     this.emitTelemetry(true);
     this.startLoop();
+  }
+
+  private initSkyDome(): void {
+    this.skyMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: {
+        uTopColor: { value: new THREE.Color(0x274c77) },
+        uMidColor: { value: new THREE.Color(0xc97b5d) },
+        uHorizonColor: { value: new THREE.Color(0xf3b883) },
+        uSunDir: { value: new THREE.Vector3(-0.65, 0.16, -0.74).normalize() },
+        uSunColor: { value: new THREE.Color(0xfff1c9) },
+        uStarIntensity: { value: 0.0 },
+      },
+      vertexShader: `
+        varying vec3 vWorldDir;
+        void main() {
+          vWorldDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vWorldDir;
+        uniform vec3 uTopColor;
+        uniform vec3 uMidColor;
+        uniform vec3 uHorizonColor;
+        uniform vec3 uSunDir;
+        uniform vec3 uSunColor;
+        uniform float uStarIntensity;
+
+        float hash(vec3 p) {
+          p = fract(p * 0.3183099 + 0.1);
+          p *= 17.0;
+          return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+        }
+
+        void main() {
+          vec3 dir = normalize(vWorldDir);
+          float h = clamp(dir.y, 0.0, 1.0);
+          vec3 sky = mix(uHorizonColor, uMidColor, smoothstep(0.0, 0.24, h));
+          sky = mix(sky, uTopColor, smoothstep(0.18, 0.78, h));
+
+          float sunDot = max(dot(dir, normalize(uSunDir)), 0.0);
+          float sunDisc = smoothstep(0.9985, 0.9996, sunDot);
+          float sunHalo = pow(sunDot, 22.0) * 0.42;
+          sky += uSunColor * (sunDisc * 1.4 + sunHalo);
+
+          if (uStarIntensity > 0.01 && h > 0.08) {
+            float star = step(0.9965, hash(floor(dir * 320.0)));
+            sky += vec3(0.9, 0.95, 1.0) * star * uStarIntensity * smoothstep(0.08, 0.35, h);
+          }
+
+          gl_FragColor = vec4(sky, 1.0);
+        }
+      `,
+    });
+
+    this.skyDome = new THREE.Mesh(new THREE.SphereGeometry(2350, 32, 20), this.skyMat);
+    this.scene.add(this.skyDome);
   }
 
   private handleContextLost = (e: Event) => {
@@ -306,11 +380,11 @@ export class DubaiMetroEngine {
   };
 
   private initGroundAndWater(): void {
-    const sandGeo = new THREE.PlaneGeometry(5200, 5200);
+    const sandGeo = new THREE.PlaneGeometry(5400, 5400);
     sandGeo.rotateX(-Math.PI * 0.5);
     const sandMat = new THREE.MeshStandardMaterial({
       map: this.textures.desertSand,
-      roughness: 0.94,
+      roughness: 0.92,
       metalness: 0.02,
     });
     this.desertGround = new THREE.Mesh(sandGeo, sandMat);
@@ -318,13 +392,14 @@ export class DubaiMetroEngine {
     this.desertGround.receiveShadow = true;
     this.scene.add(this.desertGround);
 
-    // Arabian Gulf coastline water strip to the West (-X side)
-    const waterGeo = new THREE.PlaneGeometry(2400, 5200);
+    const waterGeo = new THREE.PlaneGeometry(2400, 5400);
     waterGeo.rotateX(-Math.PI * 0.5);
     const waterMat = new THREE.MeshStandardMaterial({
       color: 0x0e7490,
-      roughness: 0.16,
-      metalness: 0.65,
+      bumpMap: this.textures.waterRipple,
+      bumpScale: 0.35,
+      roughness: 0.14,
+      metalness: 0.72,
     });
     this.gulfWater = new THREE.Mesh(waterGeo, waterMat);
     this.gulfWater.position.set(-1580, -0.05, 0);
@@ -334,13 +409,18 @@ export class DubaiMetroEngine {
   private initStreamedCorridor(): void {
     const concreteMat = new THREE.MeshStandardMaterial({
       map: this.textures.viaductConcrete,
-      roughness: 0.85,
-      metalness: 0.05,
+      roughness: 0.84,
+      metalness: 0.06,
     });
-    const railMat = new THREE.MeshStandardMaterial({
-      color: 0x64748b,
-      metalness: 0.85,
-      roughness: 0.3,
+    const trackBedMat = new THREE.MeshStandardMaterial({
+      map: this.textures.trackBed,
+      roughness: 0.8,
+      metalness: 0.12,
+    });
+    const steelRailMat = new THREE.MeshStandardMaterial({
+      color: 0xdbeafe,
+      metalness: 0.92,
+      roughness: 0.22,
     });
     const roadMat = new THREE.MeshStandardMaterial({
       map: this.textures.highwayAsphalt,
@@ -348,76 +428,88 @@ export class DubaiMetroEngine {
       metalness: 0.05,
     });
 
-    // Viaduct deck carrying both player (x=0) and AI (x=+4.6) tracks
-    const deckGeo = new THREE.BoxGeometry(10.2, 1.3, this.SEG_LEN + 0.6);
+    const deckGeo = new THREE.BoxGeometry(10.6, 1.3, this.SEG_LEN + 0.6);
     this.viaductDeckInst = new THREE.InstancedMesh(deckGeo, concreteMat, this.SEG_COUNT);
     this.viaductDeckInst.frustumCulled = false;
     this.viaductDeckInst.receiveShadow = true;
     this.scene.add(this.viaductDeckInst);
 
-    // Viaduct Y-piers
-    const pierGeo = new THREE.BoxGeometry(2.2, 10.5, 2.4);
+    // Concrete safety parapet walls on both edges of the viaduct
+    const parapetGeo = new THREE.BoxGeometry(0.32, 0.95, this.SEG_LEN + 0.6);
+    this.viaductParapetInst = new THREE.InstancedMesh(parapetGeo, concreteMat, this.SEG_COUNT * 2);
+    this.viaductParapetInst.frustumCulled = false;
+    this.scene.add(this.viaductParapetInst);
+
+    const pierGeo = new THREE.BoxGeometry(2.3, 10.5, 2.5);
     this.viaductPierInst = new THREE.InstancedMesh(pierGeo, concreteMat, this.SEG_COUNT);
     this.viaductPierInst.frustumCulled = false;
     this.scene.add(this.viaductPierInst);
 
-    // Dual steel rail ribbons (2 per track -> simplify to 2 instanced rail beds for crisp read)
-    const railGeo = new THREE.BoxGeometry(1.5, 0.18, this.SEG_LEN + 0.4);
-    this.railLeftInst = new THREE.InstancedMesh(railGeo, railMat, this.SEG_COUNT);
-    this.railLeftInst.frustumCulled = false;
-    this.scene.add(this.railLeftInst);
+    // Sleepered Track Beds (Player track x=0, Opposite track x=+4.6)
+    const bedGeo = new THREE.PlaneGeometry(2.5, this.SEG_LEN + 0.5);
+    bedGeo.rotateX(-Math.PI * 0.5);
+    this.trackBedLeftInst = new THREE.InstancedMesh(bedGeo, trackBedMat, this.SEG_COUNT);
+    this.trackBedLeftInst.frustumCulled = false;
+    this.scene.add(this.trackBedLeftInst);
 
-    this.railRightInst = new THREE.InstancedMesh(railGeo, railMat, this.SEG_COUNT);
-    this.railRightInst.frustumCulled = false;
-    this.scene.add(this.railRightInst);
+    this.trackBedRightInst = new THREE.InstancedMesh(bedGeo, trackBedMat, this.SEG_COUNT);
+    this.trackBedRightInst.frustumCulled = false;
+    this.scene.add(this.trackBedRightInst);
 
-    // Sheikh Zayed Road 12-lane Expressway beside viaduct
-    const roadGeo = new THREE.PlaneGeometry(46, this.SEG_LEN + 0.8);
+    // 4 gleaming steel running rails (2 per track)
+    const railHeadGeo = new THREE.BoxGeometry(0.09, 0.14, this.SEG_LEN + 0.5);
+    this.steelRailInst = new THREE.InstancedMesh(railHeadGeo, steelRailMat, this.SEG_COUNT * 4);
+    this.steelRailInst.frustumCulled = false;
+    this.scene.add(this.steelRailInst);
+
+    // Sheikh Zayed Road 12-lane Expressway
+    const roadGeo = new THREE.PlaneGeometry(48, this.SEG_LEN + 0.8);
     roadGeo.rotateX(-Math.PI * 0.5);
     this.highwayInst = new THREE.InstancedMesh(roadGeo, roadMat, this.SEG_COUNT);
     this.highwayInst.frustumCulled = false;
     this.highwayInst.receiveShadow = true;
     this.scene.add(this.highwayInst);
 
-    // Streetlights along Sheikh Zayed Road
+    const medianGeo = new THREE.BoxGeometry(0.9, 0.75, this.SEG_LEN + 0.6);
+    this.highwayMedianInst = new THREE.InstancedMesh(medianGeo, concreteMat, this.SEG_COUNT);
+    this.highwayMedianInst.frustumCulled = false;
+    this.scene.add(this.highwayMedianInst);
+
     const lampGeo = new THREE.CylinderGeometry(0.18, 0.25, 10.5, 6);
     const lampMat = new THREE.MeshStandardMaterial({
       color: 0xcbd5e1,
       emissive: 0xfef08a,
-      emissiveIntensity: 0.4,
+      emissiveIntensity: 0.55,
       metalness: 0.6,
-      roughness: 0.4,
+      roughness: 0.35,
     });
     this.streetLampInst = new THREE.InstancedMesh(lampGeo, lampMat, this.SEG_COUNT * 2);
     this.streetLampInst.frustumCulled = false;
     this.scene.add(this.streetLampInst);
 
-    // Date Palms lining the boulevard
     const trunkGeo = new THREE.CylinderGeometry(0.22, 0.36, 7.5, 6);
     const trunkMat = new THREE.MeshStandardMaterial({ color: 0x78553a, roughness: 0.9 });
     this.palmTrunkInst = new THREE.InstancedMesh(trunkGeo, trunkMat, this.SEG_COUNT * 2);
     this.palmTrunkInst.frustumCulled = false;
     this.scene.add(this.palmTrunkInst);
 
-    const crownGeo = new THREE.ConeGeometry(3.2, 2.8, 7);
-    crownGeo.rotateX(Math.PI);
-    const crownMat = new THREE.MeshStandardMaterial({ color: 0x3f7d20, roughness: 0.8 });
+    const crownGeo = buildPalmCrownGeometry();
+    const crownMat = new THREE.MeshStandardMaterial({ color: 0x4d7c0f, roughness: 0.78 });
     this.palmCrownInst = new THREE.InstancedMesh(crownGeo, crownMat, this.SEG_COUNT * 2);
     this.palmCrownInst.frustumCulled = false;
     this.scene.add(this.palmCrownInst);
 
-    // Moving Highway Vehicles
-    const carGeo = new THREE.BoxGeometry(2.0, 1.35, 4.4);
+    const carGeo = new THREE.BoxGeometry(2.05, 1.35, 4.5);
     const carMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      metalness: 0.55,
-      roughness: 0.3,
+      metalness: 0.62,
+      roughness: 0.25,
     });
     const trafficCount = 84;
     this.trafficInst = new THREE.InstancedMesh(carGeo, carMat, trafficCount);
     this.trafficInst.frustumCulled = false;
     const carPalette = [0xf8fafc, 0x0f172a, 0x94a3b8, 0x0284c7, 0xdc2626, 0xd97706];
-    const lanes = [-17, -12, -7, 7, 12, 17];
+    const lanes = [-17.5, -12.5, -7.5, 7.5, 12.5, 17.5];
     for (let i = 0; i < trafficCount; i++) {
       const laneIdx = i % lanes.length;
       const dir = laneIdx < 3 ? -1 : 1;
@@ -432,29 +524,30 @@ export class DubaiMetroEngine {
     if (this.trafficInst.instanceColor) this.trafficInst.instanceColor.needsUpdate = true;
     this.scene.add(this.trafficInst);
 
-    // Procedural Dubai Skyscraper Clusters (3 texture variants, 52 each = 156 towers)
     const bGeo = new THREE.BoxGeometry(1, 1, 1);
     const makeBuildingInst = (tex: THREE.CanvasTexture, emissiveGlow: number) => {
       const mat = new THREE.MeshStandardMaterial({
         map: tex,
+        bumpMap: this.textures.facadeBump,
+        bumpScale: 0.25,
         emissive: 0xfef08a,
-        emissiveMap: tex,
+        emissiveMap: this.textures.facadeEmissive,
         emissiveIntensity: emissiveGlow,
-        metalness: 0.72,
-        roughness: 0.22,
+        metalness: 0.78,
+        roughness: 0.18,
       });
+      this.buildingMats.push(mat);
       const inst = new THREE.InstancedMesh(bGeo, mat, 52);
       inst.frustumCulled = false;
       this.scene.add(inst);
       return inst;
     };
-    this.buildingCyanInst = makeBuildingInst(this.textures.facadeCyan, 0.25);
-    this.buildingGoldInst = makeBuildingInst(this.textures.facadeGold, 0.28);
-    this.buildingDarkInst = makeBuildingInst(this.textures.facadeDarkLit, 0.52);
+    this.buildingCyanInst = makeBuildingInst(this.textures.facadeCyan, 0.3);
+    this.buildingGoldInst = makeBuildingInst(this.textures.facadeGold, 0.32);
+    this.buildingDarkInst = makeBuildingInst(this.textures.facadeDarkLit, 0.65);
   }
 
   private initStationsAndLandmarks(maxAniso: number): void {
-    // 12 Stations
     for (const station of DUBAI_STATIONS) {
       const rig = createDubaiStation(station, this.textures, maxAniso);
       rig.group.visible = false;
@@ -462,7 +555,6 @@ export class DubaiMetroEngine {
       this.stationRigs.push(rig);
     }
 
-    // Iconic Landmarks positioned at exact KM along the 42.5 km route
     const addLandmark = (
       s: number,
       lateral: number,
@@ -474,26 +566,31 @@ export class DubaiMetroEngine {
       this.landmarks.push({ s, lateral, yawOffset, mesh });
     };
 
-    // KM 6.8 Union: Dubai Frame
     addLandmark(6900, -145, 0.35, createDubaiFrame(this.textures));
-    // KM 10.6 WTC: Museum of the Future + Emirates Towers
     addLandmark(10650, 95, -0.25, createMuseumOfFuture(this.textures));
     addLandmark(11350, 145, 0.15, createEmiratesTowers(this.textures));
-    // KM 14.4 Downtown: Burj Khalifa (hero landmark!)
     addLandmark(14600, 195, 0.1, createBurjKhalifa(this.textures));
-    // KM 21.6 Mall of the Emirates: Ski Dubai Dome
     addLandmark(21650, 115, 0, createSkiDubaiDome(this.textures));
-    // KM 25.4 Internet City: Burj Al Arab offshore in Gulf (-X coastal side)
     addLandmark(25400, -390, 0.3, createBurjAlArab());
-    // KM 29.8 Marina: Cayan Twisted Tower
     addLandmark(29950, -110, 0, createCayanTower(this.textures));
-    // KM 42.2 Jebel Ali Port Cranes
     addLandmark(42250, -125, 0.1, createJebelAliPort());
+
+    // Highway overhead directional gantries along Sheikh Zayed Road
+    for (let gs = 1800; gs < TOTAL_ROUTE_M; gs += 3200) {
+      addLandmark(gs, 28, 0, createHighwayGantry(this.textures));
+    }
+  }
+
+  private syncTrainCockpitVisibility(): void {
+    const isCab = this.cameraMode === 'cab';
+    this.trainRig.cockpitGroup.visible = isCab;
+    this.trainRig.exteriorLeadGroup.visible = !isCab;
   }
 
   public setCameraMode(mode: CameraMode): void {
     this.cameraMode = mode;
     this.camInitialized = false;
+    this.syncTrainCockpitVisibility();
   }
 
   public setTimeOfDay(tod: TimeOfDay): void {
@@ -502,38 +599,59 @@ export class DubaiMetroEngine {
       const sky = 0xd98a5f;
       this.scene.background = new THREE.Color(sky);
       this.fog.color.setHex(sky);
-      this.fog.density = 0.00085;
+      this.fog.density = 0.00072;
       this.sunLight.color.setHex(0xffcca0);
-      this.sunLight.intensity = 2.3;
+      this.sunLight.intensity = 2.35;
       this.hemiLight.color.setHex(0x93c5fd);
       this.hemiLight.groundColor.setHex(0xc48b5c);
-      this.hemiLight.intensity = 0.88;
+      this.hemiLight.intensity = 0.9;
       this.renderer.toneMappingExposure = 1.08;
-      this.trainRig.headlightMat.emissiveIntensity = 1.8;
+      this.trainRig.headlightMat.emissiveIntensity = 1.9;
+      this.skyMat.uniforms.uTopColor.value.setHex(0x284b7a);
+      this.skyMat.uniforms.uMidColor.value.setHex(0xc97b5d);
+      this.skyMat.uniforms.uHorizonColor.value.setHex(0xf3b883);
+      this.skyMat.uniforms.uSunDir.value.set(-0.65, 0.14, -0.75).normalize();
+      this.skyMat.uniforms.uSunColor.value.setHex(0xffe9b5);
+      this.skyMat.uniforms.uStarIntensity.value = 0.0;
+      this.buildingMats.forEach((m, idx) => (m.emissiveIntensity = idx === 2 ? 0.55 : 0.25));
     } else if (tod === 'day') {
-      const sky = 0x8bc8f5;
+      const sky = 0x9bd0f7;
       this.scene.background = new THREE.Color(sky);
       this.fog.color.setHex(sky);
-      this.fog.density = 0.00068;
-      this.sunLight.color.setHex(0xfff8eb);
-      this.sunLight.intensity = 2.6;
+      this.fog.density = 0.00058;
+      this.sunLight.color.setHex(0xfff9ee);
+      this.sunLight.intensity = 2.65;
       this.hemiLight.color.setHex(0xe0f2fe);
       this.hemiLight.groundColor.setHex(0xd4b483);
-      this.hemiLight.intensity = 1.05;
+      this.hemiLight.intensity = 1.08;
       this.renderer.toneMappingExposure = 1.02;
       this.trainRig.headlightMat.emissiveIntensity = 0.9;
+      this.skyMat.uniforms.uTopColor.value.setHex(0x1d6fb8);
+      this.skyMat.uniforms.uMidColor.value.setHex(0x60a5fa);
+      this.skyMat.uniforms.uHorizonColor.value.setHex(0xdbeafe);
+      this.skyMat.uniforms.uSunDir.value.set(0.35, 0.65, -0.45).normalize();
+      this.skyMat.uniforms.uSunColor.value.setHex(0xffffff);
+      this.skyMat.uniforms.uStarIntensity.value = 0.0;
+      this.buildingMats.forEach((m) => (m.emissiveIntensity = 0.06));
     } else {
       const sky = 0x070e1f;
       this.scene.background = new THREE.Color(sky);
       this.fog.color.setHex(sky);
-      this.fog.density = 0.00095;
-      this.sunLight.color.setHex(0x64748b);
-      this.sunLight.intensity = 0.75;
+      this.fog.density = 0.00086;
+      this.sunLight.color.setHex(0x7c93b8);
+      this.sunLight.intensity = 0.85;
       this.hemiLight.color.setHex(0x1e3a5f);
       this.hemiLight.groundColor.setHex(0x0f172a);
-      this.hemiLight.intensity = 0.65;
+      this.hemiLight.intensity = 0.72;
       this.renderer.toneMappingExposure = 1.25;
       this.trainRig.headlightMat.emissiveIntensity = 3.2;
+      this.skyMat.uniforms.uTopColor.value.setHex(0x020617);
+      this.skyMat.uniforms.uMidColor.value.setHex(0x0c1936);
+      this.skyMat.uniforms.uHorizonColor.value.setHex(0x1e293b);
+      this.skyMat.uniforms.uSunDir.value.set(-0.4, 0.45, -0.7).normalize();
+      this.skyMat.uniforms.uSunColor.value.setHex(0xcbd5e1);
+      this.skyMat.uniforms.uStarIntensity.value = 0.95;
+      this.buildingMats.forEach((m, idx) => (m.emissiveIntensity = idx === 2 ? 1.15 : 0.65));
     }
   }
 
@@ -579,7 +697,6 @@ export class DubaiMetroEngine {
     if (this.doorPhase === 'closed' && activeIdx !== -1) {
       this.beginStationBoarding(activeIdx);
     } else if (this.doorPhase === 'open' || this.doorPhase === 'opening') {
-      // Finish boarding immediately if user closes doors
       this.completeBoardingTransfer();
       this.doorPhase = 'closing';
       this.audio.playDoorChime(false);
@@ -646,7 +763,6 @@ export class DubaiMetroEngine {
       this.score += pts;
       this.lastStopGrade = `${grade} · +${pts} pts`;
 
-      // Calculate passengers alighting & boarding
       const alighting =
         stationIdx === DUBAI_STATIONS.length - 1
           ? this.passengersOnboard
@@ -700,13 +816,11 @@ export class DubaiMetroEngine {
     const simDt = dt * this.simSpeed;
     this.elapsedSimSec += simDt;
 
-    // Update AI oncoming train
     this.aiTrainS -= 24 * simDt;
     if (this.aiTrainS < this.distanceM - 1500) {
       this.aiTrainS = this.distanceM + 2600;
     }
 
-    // Handle initial Centrepoint boarding automatically on first start
     if (!this.initialBoardingDone && this.distanceM < 5 && this.doorPhase === 'open') {
       this.boardingTimer += dt;
       const frac = THREE.MathUtils.clamp(this.boardingTimer / 2.2, 0, 1);
@@ -723,12 +837,9 @@ export class DubaiMetroEngine {
       }
     }
 
-    // Door animation state machine
     if (this.doorPhase === 'opening') {
       this.doorOpenAmount = Math.min(1, this.doorOpenAmount + dt * 1.8);
-      if (this.doorOpenAmount >= 1) {
-        this.doorPhase = 'open';
-      }
+      if (this.doorOpenAmount >= 1) this.doorPhase = 'open';
     } else if (this.doorPhase === 'open') {
       this.doorOpenAmount = 1;
       if (this.initialBoardingDone) {
@@ -752,12 +863,9 @@ export class DubaiMetroEngine {
       }
     } else if (this.doorPhase === 'closing') {
       this.doorOpenAmount = Math.max(0, this.doorOpenAmount - dt * 1.8);
-      if (this.doorOpenAmount <= 0) {
-        this.doorPhase = 'closed';
-      }
+      if (this.doorOpenAmount <= 0) this.doorPhase = 'closed';
     }
 
-    // Autopilot CBTC driver logic
     if (this.autopilot && !this.routeComplete) {
       const nextSt = DUBAI_STATIONS[this.nextStationIdx];
       const distToStop = nextSt.distanceM - this.distanceM;
@@ -781,27 +889,19 @@ export class DubaiMetroEngine {
         this.notch = -1;
         this.beginStationBoarding(this.nextStationIdx);
       } else {
-        // Compute braking curve v = sqrt(2 * a * d)
         const desiredBrakingDecel = 1.05;
         const stopCurveSpeed =
           distToStop > 0 ? Math.sqrt(2 * desiredBrakingDecel * distToStop) : 0;
         const targetSpeed = Math.min(limitMs * 0.96, stopCurveSpeed);
 
-        if (this.velocityMs > targetSpeed + 1.8) {
-          this.notch = -2;
-        } else if (this.velocityMs > targetSpeed + 0.3) {
-          this.notch = -1;
-        } else if (this.velocityMs < targetSpeed - 1.5 && distToStop > 20) {
-          this.notch = 3;
-        } else if (this.velocityMs < targetSpeed - 0.3 && distToStop > 12) {
-          this.notch = 1;
-        } else {
-          this.notch = 0;
-        }
+        if (this.velocityMs > targetSpeed + 1.8) this.notch = -2;
+        else if (this.velocityMs > targetSpeed + 0.3) this.notch = -1;
+        else if (this.velocityMs < targetSpeed - 1.5 && distToStop > 20) this.notch = 3;
+        else if (this.velocityMs < targetSpeed - 0.3 && distToStop > 12) this.notch = 1;
+        else this.notch = 0;
       }
     }
 
-    // Train motion integration (blocked if doors are not closed)
     if (this.doorPhase !== 'closed') {
       this.velocityMs = 0;
       if (this.notch > 0) this.notch = 0;
@@ -810,11 +910,11 @@ export class DubaiMetroEngine {
       if (this.notch === 3) accel = 1.25;
       else if (this.notch === 2) accel = 0.85;
       else if (this.notch === 1) accel = 0.45;
-      else if (this.notch === 0) accel = -0.05; // Gentle aerodynamic/rolling drag
+      else if (this.notch === 0) accel = -0.05;
       else if (this.notch === -1) accel = -0.95;
       else if (this.notch === -2) accel = -1.65;
       else if (this.notch === -3) {
-        accel = -2.8; // Emergency brake
+        accel = -2.8;
         if (this.velocityMs > 4) {
           this.comfortPct = Math.max(40, this.comfortPct - dt * 6);
         }
@@ -831,7 +931,6 @@ export class DubaiMetroEngine {
         this.velocityMs = 0;
       }
 
-      // Advance nextStationIdx if player bypassed a station without stopping
       const currentTarget = DUBAI_STATIONS[this.nextStationIdx];
       if (
         currentTarget &&
@@ -850,6 +949,12 @@ export class DubaiMetroEngine {
       this.comfortPct = Math.min(100, this.comfortPct + dt * 0.4);
     }
 
+    // Smooth cockpit suspension pitch sway & lever tilt
+    const targetLever = -this.notch * 0.16;
+    this.leverAnimAngle = THREE.MathUtils.damp(this.leverAnimAngle, targetLever, 12, dt || 0.016);
+    const targetPitchSway = this.doorPhase === 'closed' ? this.notch * 0.0045 : 0;
+    this.cabPitchSway = THREE.MathUtils.damp(this.cabPitchSway, targetPitchSway, 6, dt || 0.016);
+
     this.audio.updateMotion(speedKmh, this.notch / 3);
   }
 
@@ -858,26 +963,40 @@ export class DubaiMetroEngine {
     const ox = _pose.x;
     const oz = _pose.z;
 
-    // 1. Keep ground & Arabian Gulf centered horizontally under train while scrolling UVs
+    this.skyDome.position.set(0, 0, 0);
     this.desertGround.position.set(0, -0.15, 0);
     this.textures.desertSand.offset.set(ox * 0.012, -oz * 0.012);
     this.gulfWater.position.set(-1580, -0.05, 0);
+    this.textures.waterRipple.offset.y += (dt || 0.016) * 0.04;
 
-    // Sun shadow rig stays anchored relative to origin
     this.sunLight.position.set(160, 140, 90);
     this.sunLight.target.position.set(0, 10, -40);
 
-    // 2. Player Train at (0, trainY, 0) oriented along track
     this.trainRig.group.position.set(0, _pose.y, 0);
-    this.trainRig.group.rotation.set(_pose.pitch, _pose.yaw, 0, 'YXZ');
+    this.trainRig.group.rotation.set(_pose.pitch + this.cabPitchSway, _pose.yaw, 0, 'YXZ');
 
-    // Animate train sliding doors (left platform side opens)
+    // Animate 3D cockpit lever & live DMI display
+    this.trainRig.cockpitLeverPivot.rotation.x = this.leverAnimAngle;
+    const nowMs = performance.now();
+    if (this.cameraMode === 'cab' && this.trainRig.dmi && nowMs - this.lastDmiUpdateMs > 85) {
+      this.lastDmiUpdateMs = nowMs;
+      const nextSt = DUBAI_STATIONS[this.nextStationIdx];
+      this.trainRig.dmi.update(
+        this.velocityMs * 3.6,
+        getSpeedLimitAt(this.distanceM, this.nextStationIdx),
+        this.notch,
+        nextSt.code,
+        nextSt.name,
+        Math.max(0, nextSt.distanceM - this.distanceM),
+        this.doorPhase !== 'closed'
+      );
+    }
+
     const slideOffset = this.doorOpenAmount * 0.85;
     for (const d of this.trainRig.doorsLeft) {
       d.position.z = (d.userData.baseZ as number) + slideOffset;
     }
 
-    // 3. AI Oncoming Train on parallel track (+4.6m right)
     const aiRelS = this.aiTrainS - this.distanceM;
     if (Math.abs(aiRelS) < 1600) {
       sampleTrackPose(this.aiTrainS, _poseNext);
@@ -894,10 +1013,11 @@ export class DubaiMetroEngine {
       this.aiTrainRig.group.visible = false;
     }
 
-    // 4. Streamed Viaduct, Rails, Highway, Palms & Streetlights
     const baseSegment = Math.floor((this.distanceM - 300) / this.SEG_LEN);
     let lampIdx = 0;
     let palmIdx = 0;
+    let parapetIdx = 0;
+    let railIdx = 0;
 
     for (let i = 0; i < this.SEG_COUNT; i++) {
       const segS = (baseSegment + i) * this.SEG_LEN;
@@ -907,40 +1027,60 @@ export class DubaiMetroEngine {
       const cosY = Math.cos(_poseNext.yaw);
       const sinY = Math.sin(_poseNext.yaw);
 
-      // Viaduct deck centered between both tracks (+2.3m lateral)
+      // Viaduct Deck
       _dummy.position.set(rx + cosY * 2.3, _poseNext.y - 0.65, rz - sinY * 2.3);
       _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
       _dummy.scale.set(1, 1, 1);
       _dummy.updateMatrix();
       this.viaductDeckInst.setMatrixAt(i, _dummy.matrix);
 
-      // Pier down to ground
+      // Viaduct Parapet Walls (Left -2.8m, Right +7.4m)
+      for (const px of [-2.8, 7.4]) {
+        _dummy.position.set(rx + cosY * px, _poseNext.y + 0.45, rz - sinY * px);
+        _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
+        _dummy.scale.set(1, 1, 1);
+        _dummy.updateMatrix();
+        this.viaductParapetInst.setMatrixAt(parapetIdx++, _dummy.matrix);
+      }
+
+      // Viaduct Pier
       _dummy.position.set(rx + cosY * 2.3, (_poseNext.y - 1.2) * 0.5, rz - sinY * 2.3);
       _dummy.rotation.set(0, _poseNext.yaw, 0);
       _dummy.scale.set(1, (_poseNext.y - 1.0) / 10.5, 1);
       _dummy.updateMatrix();
       this.viaductPierInst.setMatrixAt(i, _dummy.matrix);
 
-      // Player rail bed
-      _dummy.position.set(rx, _poseNext.y + 0.08, rz);
+      // Sleepered Track Beds
+      _dummy.position.set(rx, _poseNext.y + 0.03, rz);
       _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
       _dummy.scale.set(1, 1, 1);
       _dummy.updateMatrix();
-      this.railLeftInst.setMatrixAt(i, _dummy.matrix);
+      this.trackBedLeftInst.setMatrixAt(i, _dummy.matrix);
 
-      // Opposite rail bed
-      _dummy.position.set(rx + cosY * 4.6, _poseNext.y + 0.08, rz - sinY * 4.6);
+      _dummy.position.set(rx + cosY * 4.6, _poseNext.y + 0.03, rz - sinY * 4.6);
       _dummy.updateMatrix();
-      this.railRightInst.setMatrixAt(i, _dummy.matrix);
+      this.trackBedRightInst.setMatrixAt(i, _dummy.matrix);
 
-      // Sheikh Zayed Road 12-lane expressway at +28m right of viaduct
+      // 4 Individual Steel Running Rails
+      for (const railOffset of [-0.72, 0.72, 4.6 - 0.72, 4.6 + 0.72]) {
+        _dummy.position.set(rx + cosY * railOffset, _poseNext.y + 0.1, rz - sinY * railOffset);
+        _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
+        _dummy.scale.set(1, 1, 1);
+        _dummy.updateMatrix();
+        this.steelRailInst.setMatrixAt(railIdx++, _dummy.matrix);
+      }
+
+      // Sheikh Zayed Road + Median Jersey Barrier
       _dummy.position.set(rx + cosY * 28, 0.06, rz - sinY * 28);
       _dummy.rotation.set(0, _poseNext.yaw, 0);
       _dummy.scale.set(1, 1, 1);
       _dummy.updateMatrix();
       this.highwayInst.setMatrixAt(i, _dummy.matrix);
 
-      // Streetlights on highway median & edge
+      _dummy.position.set(rx + cosY * 28, 0.38, rz - sinY * 28);
+      _dummy.updateMatrix();
+      this.highwayMedianInst.setMatrixAt(i, _dummy.matrix);
+
       for (const lx of [28, 5.5]) {
         _dummy.position.set(rx + cosY * lx, 5.25, rz - sinY * lx);
         _dummy.rotation.set(0, _poseNext.yaw, 0);
@@ -949,8 +1089,7 @@ export class DubaiMetroEngine {
         this.streetLampInst.setMatrixAt(lampIdx++, _dummy.matrix);
       }
 
-      // Date Palms flanking Sheikh Zayed Road
-      for (const px of [-14, 55]) {
+      for (const px of [-14, 56]) {
         const jx = rx + cosY * px;
         const jz = rz - sinY * px;
         _dummy.position.set(jx, 3.75, jz);
@@ -959,7 +1098,7 @@ export class DubaiMetroEngine {
         _dummy.updateMatrix();
         this.palmTrunkInst.setMatrixAt(palmIdx, _dummy.matrix);
 
-        _dummy.position.set(jx, 7.8, jz);
+        _dummy.position.set(jx, 7.5, jz);
         _dummy.scale.set(1, 1, 1);
         _dummy.updateMatrix();
         this.palmCrownInst.setMatrixAt(palmIdx, _dummy.matrix);
@@ -967,15 +1106,17 @@ export class DubaiMetroEngine {
       }
     }
     this.viaductDeckInst.instanceMatrix.needsUpdate = true;
+    this.viaductParapetInst.instanceMatrix.needsUpdate = true;
     this.viaductPierInst.instanceMatrix.needsUpdate = true;
-    this.railLeftInst.instanceMatrix.needsUpdate = true;
-    this.railRightInst.instanceMatrix.needsUpdate = true;
+    this.trackBedLeftInst.instanceMatrix.needsUpdate = true;
+    this.trackBedRightInst.instanceMatrix.needsUpdate = true;
+    this.steelRailInst.instanceMatrix.needsUpdate = true;
     this.highwayInst.instanceMatrix.needsUpdate = true;
+    this.highwayMedianInst.instanceMatrix.needsUpdate = true;
     this.streetLampInst.instanceMatrix.needsUpdate = true;
     this.palmTrunkInst.instanceMatrix.needsUpdate = true;
     this.palmCrownInst.instanceMatrix.needsUpdate = true;
 
-    // 5. Moving Highway Traffic
     for (let i = 0; i < this.trafficVehicles.length; i++) {
       const v = this.trafficVehicles[i];
       v.offsetS += v.speedMs * dt * this.simSpeed;
@@ -999,7 +1140,6 @@ export class DubaiMetroEngine {
     }
     this.trafficInst.instanceMatrix.needsUpdate = true;
 
-    // 6. Procedural Dubai Skyscrapers in deterministic 45m corridor cells
     const cellSize = 45;
     const baseCell = Math.floor((this.distanceM - 450) / cellSize);
     let cIdx = 0;
@@ -1009,7 +1149,6 @@ export class DubaiMetroEngine {
     for (let cell = 0; cell < 39; cell++) {
       const worldCell = baseCell + cell;
       const cellS = worldCell * cellSize;
-      // Compute urban density factor along 42.5 km (higher in Deira, Downtown, Marina)
       const inDowntown = cellS > 8500 && cellS < 18500 ? 1.55 : 1.0;
       const inMarina = cellS > 27500 && cellS < 34500 ? 1.45 : 1.0;
       const inDesertOuter = cellS > 36000 ? 0.35 : 1.0;
@@ -1022,12 +1161,11 @@ export class DubaiMetroEngine {
       for (let side = 0; side < 4; side++) {
         const seed = worldCell * 17 + side * 31;
         const r1 = seededRand(seed);
-        if (cellS > 36500 && r1 > 0.45) continue; // Desert opens up near Jebel Ali!
+        if (cellS > 36500 && r1 > 0.45) continue;
 
         const r2 = seededRand(seed + 5);
         const r3 = seededRand(seed + 11);
 
-        // Place buildings on inland side (+75m..+240m) and coastal side (-48m..-180m)
         const isInland = side < 2;
         const lateral = isInland
           ? 76 + (side % 2) * 58 + r1 * 34
@@ -1056,7 +1194,6 @@ export class DubaiMetroEngine {
         }
       }
     }
-    // Hide unused slots
     _dummy.scale.set(0, 0, 0);
     _dummy.updateMatrix();
     while (cIdx < 52) this.buildingCyanInst.setMatrixAt(cIdx++, _dummy.matrix);
@@ -1066,7 +1203,6 @@ export class DubaiMetroEngine {
     this.buildingGoldInst.instanceMatrix.needsUpdate = true;
     this.buildingDarkInst.instanceMatrix.needsUpdate = true;
 
-    // 7. Stations & Platform Screen Doors + Boarding Passengers
     const timeSec = performance.now() * 0.001;
     for (const rig of this.stationRigs) {
       const relS = rig.station.distanceM - this.distanceM;
@@ -1082,7 +1218,6 @@ export class DubaiMetroEngine {
           leaf.position.z = (leaf.userData.baseZ as number) + psdSlide;
         }
 
-        // Subtle passenger waiting / boarding motion
         for (const p of rig.passengers) {
           if (isActiveStop && this.doorOpenAmount > 0.5 && p.boarding) {
             const walk = Math.sin(timeSec * 3.2 + p.phase) * 0.5 + 0.5;
@@ -1096,7 +1231,6 @@ export class DubaiMetroEngine {
       }
     }
 
-    // 8. Hero Dubai Landmarks (Visible within 2600m!)
     for (const lm of this.landmarks) {
       const relS = lm.s - this.distanceM;
       if (Math.abs(relS) < 2600) {
@@ -1115,25 +1249,23 @@ export class DubaiMetroEngine {
       }
     }
 
-    // 9. Camera Choreography (Smooth exponential damping, zero abrupt snaps)
+    // Camera Choreography
     const fwdX = -Math.sin(_pose.yaw);
     const fwdZ = -Math.cos(_pose.yaw);
     const rightX = Math.cos(_pose.yaw);
     const rightZ = -Math.sin(_pose.yaw);
 
     if (this.cameraMode === 'cab') {
-      // Driver cab eye point cleanly at leading windshield edge
-      _camTargetPos.set(
-        fwdX * 1.45,
-        _pose.y + 2.95,
-        fwdZ * 1.45
-      );
+      // Driver eye position inside the 3D cockpit overlooking the DMI desk, lever & windshield
+      const eyeFwd = 0.08;
+      const eyeUp = _pose.y + 2.95;
+      _camTargetPos.set(fwdX * eyeFwd, eyeUp, fwdZ * eyeFwd);
       _camLookAt.set(
-        fwdX * 95,
-        _pose.y + 2.4 + Math.sin(_pose.pitch) * 95,
-        fwdZ * 95
+        fwdX * 85,
+        _pose.y + 2.25 + Math.sin(_pose.pitch + this.cabPitchSway) * 85,
+        fwdZ * 85
       );
-      const targetFov = 62 + (this.velocityMs * 3.6 / 110) * 6;
+      const targetFov = 68 + (this.velocityMs * 3.6 / 110) * 5;
       if (Math.abs(this.camera.fov - targetFov) > 0.05) {
         this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 4, dt || 0.016);
         this.camera.updateProjectionMatrix();
@@ -1150,7 +1282,6 @@ export class DubaiMetroEngine {
         this.camera.updateProjectionMatrix();
       }
     } else {
-      // Drone side showcase angle
       _camTargetPos.set(
         fwdX * 14 - rightX * 28,
         _pose.y + 9.5,
@@ -1187,7 +1318,6 @@ export class DubaiMetroEngine {
     const speedKmh = this.velocityMs * 3.6;
     const limitKmh = getSpeedLimitAt(this.distanceM, this.nextStationIdx);
 
-    // Closest station for stop precision readout
     let closestErr: number | null = null;
     for (const st of DUBAI_STATIONS) {
       const diff = st.distanceM - this.distanceM;
@@ -1292,6 +1422,7 @@ export class DubaiMetroEngine {
 
     this.audio.dispose();
     this.textures.dispose();
+    this.trainRig.dmi?.dispose();
     for (const r of this.stationRigs) {
       r.signTex.dispose();
     }

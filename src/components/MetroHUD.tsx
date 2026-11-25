@@ -130,18 +130,22 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
         {/* Top-Right View & Environment Controls */}
         <div className="pointer-events-auto flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-lg border border-white/10 bg-slate-950/88 p-1">
-            {(['cab', 'chase', 'drone'] as CameraMode[]).map((mode) => (
+            {([
+              { id: 'cab', label: 'Cockpit' },
+              { id: 'chase', label: 'Chase' },
+              { id: 'drone', label: 'Drone' },
+            ] as { id: CameraMode; label: string }[]).map((mode) => (
               <button
-                key={mode}
+                key={mode.id}
                 type="button"
-                onClick={() => onSetCameraMode(mode)}
-                className={`whitespace-nowrap shrink-0 rounded-md px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
-                  cameraMode === mode
+                onClick={() => onSetCameraMode(mode.id)}
+                className={`whitespace-nowrap shrink-0 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                  cameraMode === mode.id
                     ? 'bg-sky-500 text-slate-950'
                     : 'text-slate-300 hover:text-white'
                 }`}
               >
-                {mode}
+                {mode.label}
               </button>
             ))}
           </div>

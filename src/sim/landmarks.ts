@@ -1,9 +1,18 @@
 import * as THREE from 'three';
 import { StationDef } from '../data/stations';
-import { createStationSignTexture, ProceduralTextureSet } from './textures';
+import {
+  createCockpitDmiUpdater,
+  createStationSignTexture,
+  ProceduralTextureSet,
+} from './textures';
 
 export interface TrainRig {
   group: THREE.Group;
+  exteriorLeadGroup: THREE.Group;
+  cockpitGroup: THREE.Group;
+  cockpitLeverPivot: THREE.Group;
+  cockpitWiperPivot: THREE.Group;
+  dmi: ReturnType<typeof createCockpitDmiUpdater> | null;
   doorsLeft: THREE.Mesh[];
   doorsRight: THREE.Mesh[];
   headlightMat: THREE.MeshStandardMaterial;
@@ -25,46 +34,61 @@ export interface StationRig {
 }
 
 export function createDubaiMetroTrain(
-  isAiTrain = false
+  isAiTrain = false,
+  maxAnisotropy = 4,
+  isSoftwareGl = false
 ): TrainRig {
   const group = new THREE.Group();
+  const exteriorLeadGroup = new THREE.Group();
+  const cockpitGroup = new THREE.Group();
   const doorsLeft: THREE.Mesh[] = [];
   const doorsRight: THREE.Mesh[] = [];
 
-  const bodyMat = new THREE.MeshStandardMaterial({
-    color: isAiTrain ? 0xdbeafe : 0xe2e8f0,
-    metalness: 0.65,
-    roughness: 0.28,
-  });
+  const bodyMat = isSoftwareGl
+    ? new THREE.MeshStandardMaterial({
+        color: isAiTrain ? 0xdbeafe : 0xe2e8f0,
+        metalness: 0.65,
+        roughness: 0.25,
+      })
+    : new THREE.MeshPhysicalMaterial({
+        color: isAiTrain ? 0xdbeafe : 0xe8edf2,
+        metalness: 0.68,
+        roughness: 0.22,
+        clearcoat: 0.75,
+        clearcoatRoughness: 0.14,
+      });
+
   const roofMat = new THREE.MeshStandardMaterial({
     color: 0x94a3b8,
-    metalness: 0.45,
-    roughness: 0.48,
+    metalness: 0.48,
+    roughness: 0.45,
   });
   const stripeCyanMat = new THREE.MeshStandardMaterial({
     color: 0x0284c7,
     metalness: 0.35,
-    roughness: 0.32,
+    roughness: 0.3,
   });
   const stripeRedMat = new THREE.MeshStandardMaterial({
     color: 0xdc2626,
     metalness: 0.25,
-    roughness: 0.35,
+    roughness: 0.32,
   });
   const windowBandMat = new THREE.MeshStandardMaterial({
-    color: 0x0b1322,
-    metalness: 0.85,
-    roughness: 0.12,
+    color: 0x0f172a,
+    emissive: 0xfef3c7,
+    emissiveIntensity: 0.18,
+    metalness: 0.88,
+    roughness: 0.1,
   });
   const doorMat = new THREE.MeshStandardMaterial({
     color: 0xcbd5e1,
-    metalness: 0.72,
-    roughness: 0.22,
+    metalness: 0.75,
+    roughness: 0.2,
   });
   const bogieMat = new THREE.MeshStandardMaterial({
     color: 0x1e293b,
     metalness: 0.6,
-    roughness: 0.75,
+    roughness: 0.72,
   });
   const headlightMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -86,13 +110,11 @@ export function createDubaiMetroTrain(
   const carHeight = 3.15;
   const floorY = 1.05;
 
-  // Front of train is at z = 0, extending backward along +Z (since train moves toward -Z)
   for (let c = 0; c < numCars; c++) {
     const carGroup = new THREE.Group();
     const carCenterZ = 8.4 + c * (carLength + gap);
     carGroup.position.set(0, 0, carCenterZ);
 
-    // Main body shell
     const hull = new THREE.Mesh(
       new THREE.BoxGeometry(carWidth, carHeight, carLength),
       bodyMat
@@ -102,7 +124,7 @@ export function createDubaiMetroTrain(
     hull.receiveShadow = true;
     carGroup.add(hull);
 
-    // Dark panoramic window ribbon along both sides
+    // Panoramic window band with subtle warm interior cabin glow
     const winRibbon = new THREE.Mesh(
       new THREE.BoxGeometry(carWidth + 0.04, 1.15, carLength - 0.6),
       windowBandMat
@@ -110,7 +132,6 @@ export function createDubaiMetroTrain(
     winRibbon.position.y = floorY + 1.85;
     carGroup.add(winRibbon);
 
-    // Signature Dubai Metro cyan/blue & gold-red livery stripes
     const cyanStripe = new THREE.Mesh(
       new THREE.BoxGeometry(carWidth + 0.05, 0.22, carLength - 0.2),
       stripeCyanMat
@@ -119,7 +140,6 @@ export function createDubaiMetroTrain(
     carGroup.add(cyanStripe);
 
     if (c === 0) {
-      // Gold/Red accent on Lead Gold Class carriage
       const goldStripe = new THREE.Mesh(
         new THREE.BoxGeometry(carWidth + 0.055, 0.14, carLength - 0.3),
         stripeRedMat
@@ -128,49 +148,33 @@ export function createDubaiMetroTrain(
       carGroup.add(goldStripe);
     }
 
-    // Roof HVAC pods (2 per car)
     for (const pz of [-4.2, 4.2]) {
-      const hvac = new THREE.Mesh(
-        new THREE.BoxGeometry(1.7, 0.38, 3.2),
-        roofMat
-      );
+      const hvac = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.38, 3.2), roofMat);
       hvac.position.set(0, floorY + carHeight + 0.18, pz);
       carGroup.add(hvac);
     }
 
-    // Bogies / wheelsets
     for (const bz of [-5.2, 5.2]) {
-      const bogie = new THREE.Mesh(
-        new THREE.BoxGeometry(2.15, 0.55, 2.5),
-        bogieMat
-      );
+      const bogie = new THREE.Mesh(new THREE.BoxGeometry(2.15, 0.55, 2.5), bogieMat);
       bogie.position.set(0, 0.65, bz);
       carGroup.add(bogie);
     }
 
-    // 3 pairs of sliding doors on each side
     const doorOffsets = [-4.6, 0, 4.6];
     for (const dz of doorOffsets) {
-      const leftDoor = new THREE.Mesh(
-        new THREE.BoxGeometry(0.08, 2.05, 1.45),
-        doorMat
-      );
+      const leftDoor = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.05, 1.45), doorMat);
       leftDoor.position.set(-carWidth * 0.5 - 0.02, floorY + 1.35, dz);
       leftDoor.userData.baseZ = dz;
       carGroup.add(leftDoor);
       doorsLeft.push(leftDoor);
 
-      const rightDoor = new THREE.Mesh(
-        new THREE.BoxGeometry(0.08, 2.05, 1.45),
-        doorMat
-      );
+      const rightDoor = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.05, 1.45), doorMat);
       rightDoor.position.set(carWidth * 0.5 + 0.02, floorY + 1.35, dz);
       rightDoor.userData.baseZ = dz;
       carGroup.add(rightDoor);
       doorsRight.push(rightDoor);
     }
 
-    // Inter-car articulated gangway bellows
     if (c < numCars - 1) {
       const bellows = new THREE.Mesh(
         new THREE.BoxGeometry(2.1, 2.6, gap + 0.2),
@@ -183,10 +187,8 @@ export function createDubaiMetroTrain(
     group.add(carGroup);
   }
 
-  // Aerodynamic Front Nose Cone (at z = 0 .. +0.4)
-  const noseGroup = new THREE.Group();
-  noseGroup.position.set(0, 0, 0.4);
-
+  // Aerodynamic Front Nose Cone (hidden only in interior Cockpit view so forward view is clean)
+  exteriorLeadGroup.position.set(0, 0, 0.4);
   const noseLower = new THREE.Mesh(
     new THREE.CylinderGeometry(1.15, 1.45, 2.3, 12),
     bodyMat
@@ -194,7 +196,7 @@ export function createDubaiMetroTrain(
   noseLower.rotation.x = Math.PI * 0.38;
   noseLower.scale.set(1.0, 1.0, 0.68);
   noseLower.position.set(0, floorY + 0.75, -0.8);
-  noseGroup.add(noseLower);
+  exteriorLeadGroup.add(noseLower);
 
   const noseWindshield = new THREE.Mesh(
     new THREE.BoxGeometry(2.25, 1.25, 1.6),
@@ -202,25 +204,22 @@ export function createDubaiMetroTrain(
   );
   noseWindshield.rotation.x = -0.35;
   noseWindshield.position.set(0, floorY + 1.95, -0.45);
-  noseGroup.add(noseWindshield);
+  exteriorLeadGroup.add(noseWindshield);
 
-  // Twin LED Headlights
   for (const hx of [-0.82, 0.82]) {
     const hl = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.16, 0.2), headlightMat);
     hl.position.set(hx, floorY + 0.72, -1.68);
-    noseGroup.add(hl);
+    exteriorLeadGroup.add(hl);
   }
 
-  // Destination LED Strip
   const cabScreen = new THREE.Mesh(
     new THREE.PlaneGeometry(1.4, 0.24),
     new THREE.MeshBasicMaterial({ color: 0xf59e0b })
   );
   cabScreen.rotation.y = Math.PI;
   cabScreen.position.set(0, floorY + 2.55, -0.95);
-  noseGroup.add(cabScreen);
-
-  group.add(noseGroup);
+  exteriorLeadGroup.add(cabScreen);
+  group.add(exteriorLeadGroup);
 
   // Rear Tail Cone
   const tailZ = 8.4 + (numCars - 1) * (carLength + gap) + carLength * 0.5;
@@ -239,12 +238,159 @@ export function createDubaiMetroTrain(
     group.add(tl);
   }
 
-  return { group, doorsLeft, doorsRight, headlightMat, cabScreen };
+  // ---------------- 3D DRIVER COCKPIT INTERIOR (Player train only) ----------------
+  const cockpitLeverPivot = new THREE.Group();
+  const cockpitWiperPivot = new THREE.Group();
+  let dmi: ReturnType<typeof createCockpitDmiUpdater> | null = null;
+
+  if (!isAiTrain) {
+    const dashMat = new THREE.MeshStandardMaterial({
+      color: 0x161e2e,
+      roughness: 0.55,
+      metalness: 0.25,
+    });
+    const trimMat = new THREE.MeshStandardMaterial({
+      color: 0x64748b,
+      roughness: 0.3,
+      metalness: 0.75,
+    });
+    const pillarMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      roughness: 0.65,
+      metalness: 0.2,
+    });
+
+    // Main sloped Driver Desk (positioned cleanly below eye level at y = 2.15..2.35, z = -0.35..-1.25)
+    const deskBase = new THREE.Mesh(new THREE.BoxGeometry(2.42, 0.58, 1.05), dashMat);
+    deskBase.position.set(0, floorY + 1.02, -0.78);
+    deskBase.rotation.x = 0.22;
+    cockpitGroup.add(deskBase);
+
+    // Sleek Titanium Desk Trim Lip
+    const deskLip = new THREE.Mesh(new THREE.BoxGeometry(2.44, 0.05, 0.08), trimMat);
+    deskLip.position.set(0, floorY + 1.24, -0.28);
+    cockpitGroup.add(deskLip);
+
+    // Outer nose hood tip visible below windshield sill
+    const hoodTip = new THREE.Mesh(new THREE.BoxGeometry(2.26, 0.25, 0.72), bodyMat);
+    hoodTip.position.set(0, floorY + 1.04, -1.45);
+    hoodTip.rotation.x = 0.24;
+    cockpitGroup.add(hoodTip);
+
+    // Wrap-around A-Pillars (Left & Right) angled along windshield rake
+    for (const px of [-1.22, 1.22]) {
+      const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.11, 1.52, 0.14), pillarMat);
+      pillar.position.set(px, floorY + 1.92, -0.82);
+      pillar.rotation.x = -0.32;
+      pillar.rotation.z = px < 0 ? -0.06 : 0.06;
+      cockpitGroup.add(pillar);
+    }
+
+    // Overhead Header Console & Sun Visor
+    const headerBar = new THREE.Mesh(new THREE.BoxGeometry(2.54, 0.24, 0.68), pillarMat);
+    headerBar.position.set(0, floorY + 2.58, -0.58);
+    cockpitGroup.add(headerBar);
+
+    const visor = new THREE.Mesh(
+      new THREE.BoxGeometry(2.24, 0.08, 0.18),
+      new THREE.MeshStandardMaterial({
+        color: 0x020617,
+        transparent: true,
+        opacity: 0.75,
+        roughness: 0.2,
+      })
+    );
+    visor.position.set(0, floorY + 2.46, -0.94);
+    visor.rotation.x = 0.28;
+    cockpitGroup.add(visor);
+
+    // Live 3D DMI Digital Speedometer & ATP Screen (mounted angled toward driver)
+    dmi = createCockpitDmiUpdater(maxAnisotropy);
+    const dmiHousing = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.4, 0.06), pillarMat);
+    dmiHousing.position.set(0.05, floorY + 1.37, -0.78);
+    dmiHousing.rotation.x = -0.52;
+    cockpitGroup.add(dmiHousing);
+
+    const dmiScreen = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.7, 0.35),
+      new THREE.MeshBasicMaterial({ map: dmi.texture })
+    );
+    dmiScreen.position.set(0.05, floorY + 1.385, -0.755);
+    dmiScreen.rotation.x = -0.52;
+    cockpitGroup.add(dmiScreen);
+
+    // Physical Master Controller Throttle/Brake Lever (left of DMI)
+    const leverSlot = new THREE.Mesh(
+      new THREE.BoxGeometry(0.14, 0.04, 0.34),
+      new THREE.MeshStandardMaterial({ color: 0x020617, roughness: 0.8 })
+    );
+    leverSlot.position.set(-0.56, floorY + 1.28, -0.62);
+    leverSlot.rotation.x = 0.22;
+    cockpitGroup.add(leverSlot);
+
+    cockpitLeverPivot.position.set(-0.56, floorY + 1.26, -0.62);
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.022, 0.22, 10), trimMat);
+    shaft.position.y = 0.11;
+    cockpitLeverPivot.add(shaft);
+
+    const handleGrip = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.028, 0.028, 0.16, 12),
+      new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.35, metalness: 0.3 })
+    );
+    handleGrip.rotation.z = Math.PI * 0.5;
+    handleGrip.position.y = 0.22;
+    cockpitLeverPivot.add(handleGrip);
+    cockpitGroup.add(cockpitLeverPivot);
+
+    // Console Pushbuttons (Door Open Green, Door Close Amber, E-Stop Red Mushroom)
+    const btnConfigs = [
+      { x: 0.56, z: -0.56, color: 0x10b981, emissive: 0x059669, r: 0.032 },
+      { x: 0.66, z: -0.56, color: 0xf59e0b, emissive: 0xd97706, r: 0.032 },
+      { x: 0.8, z: -0.64, color: 0xef4444, emissive: 0xb91c1c, r: 0.045 },
+    ];
+    for (const bc of btnConfigs) {
+      const btn = new THREE.Mesh(
+        new THREE.CylinderGeometry(bc.r, bc.r * 1.1, 0.035, 14),
+        new THREE.MeshStandardMaterial({
+          color: bc.color,
+          emissive: bc.emissive,
+          emissiveIntensity: 0.85,
+          roughness: 0.3,
+        })
+      );
+      btn.position.set(bc.x, floorY + 1.27, bc.z);
+      btn.rotation.x = 0.22;
+      cockpitGroup.add(btn);
+    }
+
+    // Subtle Windshield Wiper resting on lower windshield edge
+    cockpitWiperPivot.position.set(0.15, floorY + 1.22, -1.12);
+    const wiperArm = new THREE.Mesh(new THREE.BoxGeometry(0.025, 0.85, 0.02), pillarMat);
+    wiperArm.position.y = 0.42;
+    cockpitWiperPivot.add(wiperArm);
+    cockpitWiperPivot.rotation.z = 1.25;
+    cockpitGroup.add(cockpitWiperPivot);
+
+    cockpitGroup.visible = false;
+    group.add(cockpitGroup);
+  }
+
+  return {
+    group,
+    exteriorLeadGroup,
+    cockpitGroup,
+    cockpitLeverPivot,
+    cockpitWiperPivot,
+    dmi,
+    doorsLeft,
+    doorsRight,
+    headlightMat,
+    cabScreen,
+  };
 }
 
 function createPassengerFigure(robeVariant: number): THREE.Group {
   const fig = new THREE.Group();
-
   const skinMat = new THREE.MeshStandardMaterial({ color: 0xc68b59, roughness: 0.75 });
   const palette = [0xf8fafc, 0x1e293b, 0x0f172a, 0x334155, 0x0284c7, 0xb45309];
   const outfitColor = palette[robeVariant % palette.length];
@@ -263,7 +409,6 @@ function createPassengerFigure(robeVariant: number): THREE.Group {
   fig.add(head);
 
   if (robeVariant % 3 === 0) {
-    // Traditional Ghutra headwear
     const ghutra = new THREE.Mesh(
       new THREE.CylinderGeometry(0.15, 0.17, 0.22, 8),
       new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85 })
@@ -287,20 +432,20 @@ export function createDubaiStation(
   const stationLength = 104;
   const shellColor =
     station.architectureTheme === 'gold-shell'
-      ? 0xd4a853
+      ? 0xd9ad58
       : station.architectureTheme === 'heritage-sandstone'
       ? 0xc99c63
       : 0xcbd5e1;
 
   const goldShellMat = new THREE.MeshStandardMaterial({
     color: shellColor,
-    metalness: 0.72,
-    roughness: 0.28,
+    metalness: 0.76,
+    roughness: 0.24,
   });
   const ribMat = new THREE.MeshStandardMaterial({
     color: 0x947536,
-    metalness: 0.8,
-    roughness: 0.24,
+    metalness: 0.82,
+    roughness: 0.22,
   });
   const glassCanopyMat = new THREE.MeshPhysicalMaterial({
     color: 0x38bdf8,
@@ -317,24 +462,22 @@ export function createDubaiStation(
   });
   const platformMat = new THREE.MeshStandardMaterial({
     map: textures.platformFloor,
-    roughness: 0.55,
-    metalness: 0.1,
+    roughness: 0.52,
+    metalness: 0.12,
   });
   const psdFrameMat = new THREE.MeshStandardMaterial({
     color: 0x334155,
-    metalness: 0.75,
-    roughness: 0.28,
+    metalness: 0.78,
+    roughness: 0.25,
   });
   const psdGlassMat = new THREE.MeshStandardMaterial({
     color: 0xbae6fd,
-    metalness: 0.2,
+    metalness: 0.25,
     roughness: 0.1,
     transparent: true,
     opacity: 0.52,
   });
 
-  // 1. Platforms (Left side x = -4.2, Right side x = +8.8 so both tracks are flanked)
-  // Note: Player track is at x = 0; Opposite AI track is at x = +4.6
   const leftPlatform = new THREE.Mesh(
     new THREE.BoxGeometry(5.2, 1.15, stationLength),
     platformMat
@@ -351,7 +494,6 @@ export function createDubaiStation(
   rightPlatform.receiveShadow = true;
   group.add(rightPlatform);
 
-  // Under-platform concourse & support columns down to street
   const concourseBox = new THREE.Mesh(
     new THREE.BoxGeometry(18.5, 3.4, stationLength * 0.75),
     concreteMat
@@ -359,24 +501,16 @@ export function createDubaiStation(
   concourseBox.position.set(2.3, -2.5, 42);
   group.add(concourseBox);
 
-  // Escalator skybridge entrances to Sheikh Zayed Rd
   for (const side of [-1, 1]) {
-    const bridge = new THREE.Mesh(
-      new THREE.BoxGeometry(12, 2.8, 7.5),
-      glassCanopyMat
-    );
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(12, 2.8, 7.5), glassCanopyMat);
     bridge.position.set(2.3 + side * 14, -2.1, 42);
     group.add(bridge);
 
-    const tower = new THREE.Mesh(
-      new THREE.BoxGeometry(5.5, 11.5, 7.5),
-      goldShellMat
-    );
+    const tower = new THREE.Mesh(new THREE.BoxGeometry(5.5, 11.5, 7.5), goldShellMat);
     tower.position.set(2.3 + side * 20, -4.5, 42);
     group.add(tower);
   }
 
-  // 2. Iconic Curved Dubai Metro Aero-Shell Canopy (spanning x=-7 to x=+11.6)
   const archCount = 11;
   const archGeo = new THREE.TorusGeometry(9.8, 0.28, 8, 28, Math.PI);
   for (let i = 0; i < archCount; i++) {
@@ -386,7 +520,6 @@ export function createDubaiStation(
     group.add(arch);
   }
 
-  // Curved Outer Gold-Shell Roof Panels (centered around theta=PI so rotation.x=+PI/2 arches overhead)
   const shellRoof = new THREE.Mesh(
     new THREE.CylinderGeometry(
       9.9,
@@ -405,7 +538,6 @@ export function createDubaiStation(
   shellRoof.material.side = THREE.DoubleSide;
   group.add(shellRoof);
 
-  // Side Curtain Glass Walls
   for (const gx of [-6.95, 11.55]) {
     const wall = new THREE.Mesh(
       new THREE.BoxGeometry(0.18, 4.4, stationLength),
@@ -415,23 +547,16 @@ export function createDubaiStation(
     group.add(wall);
   }
 
-  // 3. Platform Screen Doors (along player track edge x = -1.78, aligned to train cars at 8.4 + c * 16.85)
   const psdBaseZStart = 8.4;
   for (let car = 0; car < 5; car++) {
     const carZ = psdBaseZStart + car * 16.85;
     for (const dz of [-4.6, 0, 4.6]) {
       const doorZ = carZ + dz;
-      const frame = new THREE.Mesh(
-        new THREE.BoxGeometry(0.16, 2.35, 0.25),
-        psdFrameMat
-      );
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(0.16, 2.35, 0.25), psdFrameMat);
       frame.position.set(-1.75, 2.25, doorZ - 0.9);
       group.add(frame);
 
-      const leaf = new THREE.Mesh(
-        new THREE.BoxGeometry(0.08, 2.2, 1.5),
-        psdGlassMat
-      );
+      const leaf = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.2, 1.5), psdGlassMat);
       leaf.position.set(-1.75, 2.2, doorZ);
       leaf.userData.baseZ = doorZ;
       group.add(leaf);
@@ -439,7 +564,6 @@ export function createDubaiStation(
     }
   }
 
-  // 4. Precision Stop Marker Sign at z = 0 (front nose aligns here!)
   const stopPost = new THREE.Mesh(
     new THREE.BoxGeometry(0.18, 2.8, 0.18),
     new THREE.MeshStandardMaterial({ color: 0xdc2626, roughness: 0.3 })
@@ -454,7 +578,6 @@ export function createDubaiStation(
   stopBoard.position.set(-2.1, 3.4, 0);
   group.add(stopBoard);
 
-  // 5. Bilingual Station Signage
   const signTex = createStationSignTexture(
     station.code,
     station.name,
@@ -468,14 +591,13 @@ export function createDubaiStation(
     group.add(signBoard);
   }
 
-  // 6. Waiting Passengers on the left platform
   const pCount = 16;
   for (let i = 0; i < pCount; i++) {
     const pMesh = createPassengerFigure(i);
     const px = -2.8 - (i % 3) * 0.7;
     const pz = 5 + i * 4.6 + (Math.random() - 0.5) * 1.4;
     pMesh.position.set(px, 1.12, pz);
-    pMesh.rotation.y = Math.PI * 0.5; // Facing track
+    pMesh.rotation.y = Math.PI * 0.5;
     group.add(pMesh);
     passengers.push({
       mesh: pMesh,
@@ -496,33 +618,35 @@ export function createBurjKhalifa(textures: ProceduralTextureSet): THREE.Group {
 
   const glassMat = new THREE.MeshStandardMaterial({
     map: textures.facadeCyan,
-    metalness: 0.85,
-    roughness: 0.16,
+    bumpMap: textures.facadeBump,
+    bumpScale: 0.35,
+    emissive: 0x38bdf8,
+    emissiveMap: textures.facadeEmissive,
+    emissiveIntensity: 0.55,
+    metalness: 0.88,
+    roughness: 0.14,
   });
   const silverRibMat = new THREE.MeshStandardMaterial({
     color: 0xe2e8f0,
-    metalness: 0.9,
-    roughness: 0.2,
+    metalness: 0.92,
+    roughness: 0.18,
   });
   const spireMat = new THREE.MeshStandardMaterial({
     color: 0xf8fafc,
     emissive: 0x38bdf8,
-    emissiveIntensity: 0.85,
+    emissiveIntensity: 1.35,
     metalness: 0.9,
     roughness: 0.15,
   });
 
-  // Grand Downtown Podium
   const podium = new THREE.Mesh(new THREE.CylinderGeometry(42, 48, 14, 6), silverRibMat);
   podium.position.y = 7;
   group.add(podium);
 
-  // Central hexagonal core climbing 290m
   const core = new THREE.Mesh(new THREE.CylinderGeometry(7.5, 16, 290, 6), glassMat);
   core.position.y = 145;
   group.add(core);
 
-  // Y-shaped spiraling setback tiers (3 wings x 5 stepped heights = 15 distinct setbacks)
   const wingAngles = [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3];
   const tierHeights = [75, 120, 168, 212, 252];
   const tierRadii = [28, 22, 16, 11, 7];
@@ -549,14 +673,12 @@ export function createBurjKhalifa(textures: ProceduralTextureSet): THREE.Group {
     }
   }
 
-  // Iconic Needle Spire up to 380m
   const spire = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 3.2, 95, 8), spireMat);
   spire.position.y = 290 + 47.5;
   group.add(spire);
 
-  // Aviation Warning Beacon
   const beacon = new THREE.Mesh(
-    new THREE.SphereGeometry(1.4, 8, 8),
+    new THREE.SphereGeometry(1.6, 8, 8),
     new THREE.MeshBasicMaterial({ color: 0xef4444 })
   );
   beacon.position.y = 386;
@@ -568,7 +690,6 @@ export function createBurjKhalifa(textures: ProceduralTextureSet): THREE.Group {
 export function createMuseumOfFuture(textures: ProceduralTextureSet): THREE.Group {
   const group = new THREE.Group();
 
-  // Landscaped green hill mound
   const mound = new THREE.Mesh(
     new THREE.ConeGeometry(44, 14, 24),
     new THREE.MeshStandardMaterial({ color: 0x3f6212, roughness: 0.9 })
@@ -578,19 +699,18 @@ export function createMuseumOfFuture(textures: ProceduralTextureSet): THREE.Grou
 
   const plinth = new THREE.Mesh(
     new THREE.CylinderGeometry(28, 32, 6, 24),
-    new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.5, roughness: 0.4 })
+    new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.55, roughness: 0.35 })
   );
   plinth.position.y = 14;
   group.add(plinth);
 
-  // Iconic Inclined Elliptical Torus with Arabic Calligraphy
   const torusMat = new THREE.MeshStandardMaterial({
     map: textures.museumCalligraphy,
-    emissive: 0x0284c7,
+    emissive: 0x38bdf8,
     emissiveMap: textures.museumCalligraphy,
-    emissiveIntensity: 0.35,
-    metalness: 0.85,
-    roughness: 0.2,
+    emissiveIntensity: 0.45,
+    metalness: 0.88,
+    roughness: 0.16,
   });
   const torus = new THREE.Mesh(new THREE.TorusGeometry(24, 9.5, 24, 48), torusMat);
   torus.scale.set(1.18, 1.42, 0.85);
@@ -606,16 +726,15 @@ export function createDubaiFrame(textures: ProceduralTextureSet): THREE.Group {
   const group = new THREE.Group();
   const goldMat = new THREE.MeshStandardMaterial({
     map: textures.dubaiFrameGold,
-    metalness: 0.88,
-    roughness: 0.22,
+    metalness: 0.9,
+    roughness: 0.18,
   });
   const glassMat = new THREE.MeshStandardMaterial({
     color: 0x38bdf8,
-    metalness: 0.8,
-    roughness: 0.12,
+    metalness: 0.85,
+    roughness: 0.1,
   });
 
-  // Podium base
   const base = new THREE.Mesh(
     new THREE.BoxGeometry(92, 8, 22),
     new THREE.MeshStandardMaterial({ color: 0xd6cfc2, roughness: 0.7 })
@@ -623,14 +742,12 @@ export function createDubaiFrame(textures: ProceduralTextureSet): THREE.Group {
   base.position.y = 4;
   group.add(base);
 
-  // Two 125m vertical towers
   for (const sx of [-36, 36]) {
     const tower = new THREE.Mesh(new THREE.BoxGeometry(12, 125, 14), goldMat);
     tower.position.set(sx, 66.5, 0);
     group.add(tower);
   }
 
-  // Top Skybridge Deck
   const topBeam = new THREE.Mesh(new THREE.BoxGeometry(84, 14, 15), goldMat);
   topBeam.position.y = 128;
   group.add(topBeam);
@@ -646,14 +763,16 @@ export function createEmiratesTowers(textures: ProceduralTextureSet): THREE.Grou
   const group = new THREE.Group();
   const silverGlass = new THREE.MeshStandardMaterial({
     map: textures.facadeCyan,
+    bumpMap: textures.facadeBump,
+    bumpScale: 0.3,
     color: 0xe2e8f0,
     metalness: 0.85,
-    roughness: 0.18,
+    roughness: 0.16,
   });
   const trimMat = new THREE.MeshStandardMaterial({
     color: 0xf8fafc,
-    metalness: 0.75,
-    roughness: 0.25,
+    metalness: 0.78,
+    roughness: 0.22,
   });
 
   const configs = [
@@ -662,7 +781,6 @@ export function createEmiratesTowers(textures: ProceduralTextureSet): THREE.Grou
   ];
 
   for (const cfg of configs) {
-    // Equilateral triangular prism tower
     const tower = new THREE.Mesh(
       new THREE.CylinderGeometry(cfg.r * 0.85, cfg.r, cfg.h, 3),
       silverGlass
@@ -685,7 +803,6 @@ export function createEmiratesTowers(textures: ProceduralTextureSet): THREE.Grou
 export function createBurjAlArab(): THREE.Group {
   const group = new THREE.Group();
 
-  // Offshore man-made island & causeway
   const island = new THREE.Mesh(
     new THREE.CylinderGeometry(42, 46, 3.5, 24),
     new THREE.MeshStandardMaterial({ color: 0xe2d5be, roughness: 0.85 })
@@ -693,16 +810,17 @@ export function createBurjAlArab(): THREE.Group {
   island.position.y = 1.75;
   group.add(island);
 
-  // Iconic White Sail Core
   const sailMat = new THREE.MeshStandardMaterial({
     color: 0xf8fafc,
-    roughness: 0.35,
-    metalness: 0.15,
+    emissive: 0x0284c7,
+    emissiveIntensity: 0.18,
+    roughness: 0.32,
+    metalness: 0.18,
   });
   const exoskeletonMat = new THREE.MeshStandardMaterial({
     color: 0x0284c7,
-    metalness: 0.7,
-    roughness: 0.25,
+    metalness: 0.72,
+    roughness: 0.24,
   });
 
   const sailBody = new THREE.Mesh(
@@ -713,12 +831,10 @@ export function createBurjAlArab(): THREE.Group {
   sailBody.position.set(0, 80, 0);
   group.add(sailBody);
 
-  // Blue glass spine & mast
   const spine = new THREE.Mesh(new THREE.BoxGeometry(6, 185, 8), exoskeletonMat);
   spine.position.set(0, 92.5, -4);
   group.add(spine);
 
-  // Cantilevered Helipad Disc
   const helipad = new THREE.Mesh(
     new THREE.CylinderGeometry(11, 9, 2.2, 20),
     new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.5 })
@@ -739,14 +855,15 @@ export function createSkiDubaiDome(textures: ProceduralTextureSet): THREE.Group 
   mallBase.position.y = 10;
   group.add(mallBase);
 
-  // Tilted futuristic Ski Slope Tube
   const slope = new THREE.Mesh(
     new THREE.CylinderGeometry(15, 20, 92, 16),
     new THREE.MeshStandardMaterial({
       map: textures.facadeCyan,
+      bumpMap: textures.facadeBump,
+      bumpScale: 0.25,
       color: 0xe0f2fe,
-      metalness: 0.75,
-      roughness: 0.22,
+      metalness: 0.78,
+      roughness: 0.2,
     })
   );
   slope.rotation.z = -0.45;
@@ -760,11 +877,12 @@ export function createCayanTower(textures: ProceduralTextureSet): THREE.Group {
   const group = new THREE.Group();
   const mat = new THREE.MeshStandardMaterial({
     map: textures.facadeGold,
-    metalness: 0.8,
-    roughness: 0.22,
+    bumpMap: textures.facadeBump,
+    bumpScale: 0.3,
+    metalness: 0.82,
+    roughness: 0.2,
   });
 
-  // 18 twisting floor segments (90-degree helical rotation!)
   const segCount = 18;
   const segH = 8.2;
   for (let i = 0; i < segCount; i++) {
@@ -800,5 +918,31 @@ export function createJebelAliPort(): THREE.Group {
     stack.position.set(22, 4, gz);
     group.add(stack);
   }
+  return group;
+}
+
+export function createHighwayGantry(textures: ProceduralTextureSet): THREE.Group {
+  const group = new THREE.Group();
+  const steelMat = new THREE.MeshStandardMaterial({
+    color: 0x94a3b8,
+    metalness: 0.75,
+    roughness: 0.3,
+  });
+
+  for (const px of [-24, 24]) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.48, 10.5, 8), steelMat);
+    post.position.set(px, 5.25, 0);
+    group.add(post);
+  }
+
+  const truss = new THREE.Mesh(new THREE.BoxGeometry(50, 0.9, 0.9), steelMat);
+  truss.position.set(0, 9.8, 0);
+  group.add(truss);
+
+  const signMat = new THREE.MeshBasicMaterial({ map: textures.highwayGantry });
+  const sign = new THREE.Mesh(new THREE.BoxGeometry(18, 3.4, 0.3), signMat);
+  sign.position.set(0, 9.8, 0.55);
+  group.add(sign);
+
   return group;
 }
