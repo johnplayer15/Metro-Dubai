@@ -1,0 +1,6 @@
+{
+  "name": "Dubai Metro Rail Simulator",
+  "description": "Drive a 5-car Dubai Metro train across 42.5 km of the Red Line along Sheikh Zayed Road, docking at 12 iconic stations to pick up and drop off passengers amidst Dubai's skyline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
