@@ -5,7 +5,7 @@ import {
   CameraMode,
   DubaiMetroEngine,
   SimTelemetry,
-  TimeOfDay,
+  WeatherMode,
 } from './sim/DubaiMetroEngine';
 
 const INITIAL_TELEMETRY: SimTelemetry = {
@@ -31,6 +31,11 @@ const INITIAL_TELEMETRY: SimTelemetry = {
   comfortPct: 100,
   overspeeding: false,
   autopilot: false,
+  speedLockEnabled: false,
+  speedLockKmh: 85,
+  weatherMode: 'auto',
+  activeWeather: 'sunny',
+  wiperActive: false,
   simSpeed: 1,
   routeComplete: false,
   elapsedSimSec: 0,
@@ -42,7 +47,6 @@ export default function App() {
 
   const [telemetry, setTelemetry] = useState<SimTelemetry>(INITIAL_TELEMETRY);
   const [cameraMode, setCameraMode] = useState<CameraMode>('cab');
-  const [timeOfDay, setTimeOfDay] = useState<TimeOfDay>('sunset');
   const [muted, setMuted] = useState(false);
   const [hudCollapsed, setHudCollapsed] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
@@ -69,7 +73,14 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       const eng = engineRef.current;
       if (!eng) return;
-      if (e.repeat && (e.code === 'Space' || e.code === 'KeyH' || e.code === 'KeyC')) {
+      if (
+        e.repeat &&
+        (e.code === 'Space' ||
+          e.code === 'KeyH' ||
+          e.code === 'KeyC' ||
+          e.code === 'KeyL' ||
+          e.code === 'KeyV')
+      ) {
         return;
       }
 
@@ -90,6 +101,20 @@ export default function App() {
           break;
         case 'KeyB':
           eng.soundHorn();
+          break;
+        case 'KeyL':
+          eng.toggleSpeedLock();
+          break;
+        case 'KeyV':
+          eng.toggleWiper();
+          break;
+        case 'Equal':
+        case 'NumpadAdd':
+          eng.adjustSpeedLock(5);
+          break;
+        case 'Minus':
+        case 'NumpadSubtract':
+          eng.adjustSpeedLock(-5);
           break;
         case 'KeyH':
           setHudCollapsed((prev) => !prev);
@@ -117,7 +142,6 @@ export default function App() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-slate-950">
-      {/* Isolated WebGL mount container outside React HUD overlays */}
       <div ref={canvasMountRef} className="h-full w-full" />
 
       {contextLost && (
@@ -136,7 +160,6 @@ export default function App() {
       <MetroHUD
         telemetry={telemetry}
         cameraMode={cameraMode}
-        timeOfDay={timeOfDay}
         muted={muted}
         hudCollapsed={hudCollapsed}
         mapOpen={mapOpen}
@@ -144,9 +167,8 @@ export default function App() {
           setCameraMode(m);
           engineRef.current?.setCameraMode(m);
         }}
-        onSetTimeOfDay={(t) => {
-          setTimeOfDay(t);
-          engineRef.current?.setTimeOfDay(t);
+        onSetWeatherMode={(w: WeatherMode) => {
+          engineRef.current?.setWeatherMode(w);
         }}
         onToggleMute={() => {
           setMuted((prev) => {
@@ -163,6 +185,9 @@ export default function App() {
         onToggleAutopilot={() =>
           engineRef.current?.setAutopilot(!telemetry.autopilot)
         }
+        onToggleSpeedLock={() => engineRef.current?.toggleSpeedLock()}
+        onAdjustSpeedLock={(d) => engineRef.current?.adjustSpeedLock(d)}
+        onToggleWiper={() => engineRef.current?.toggleWiper()}
         onSetSimSpeed={(s) => engineRef.current?.setSimSpeed(s)}
         onRestart={() => engineRef.current?.restartRoute()}
       />

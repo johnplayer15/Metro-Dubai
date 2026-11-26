@@ -2,14 +2,18 @@ import React from 'react';
 import {
   ChevronDown,
   ChevronUp,
+  CloudFog,
   DoorOpen,
+  Lock,
   Map as MapIcon,
-  Moon,
+  Minus,
+  Plus,
   RotateCcw,
   Sun,
-  Sunset,
+  Unlock,
   Volume2,
   VolumeX,
+  Wind,
   X,
 } from 'lucide-react';
 import {
@@ -17,17 +21,21 @@ import {
   TOTAL_ROUTE_KM,
   TRAIN_MAX_CAPACITY,
 } from '../data/stations';
-import { CameraMode, SimTelemetry, TimeOfDay } from '../sim/DubaiMetroEngine';
+import {
+  ActiveWeather,
+  CameraMode,
+  SimTelemetry,
+  WeatherMode,
+} from '../sim/DubaiMetroEngine';
 
 interface MetroHUDProps {
   telemetry: SimTelemetry;
   cameraMode: CameraMode;
-  timeOfDay: TimeOfDay;
   muted: boolean;
   hudCollapsed: boolean;
   mapOpen: boolean;
   onSetCameraMode: (m: CameraMode) => void;
-  onSetTimeOfDay: (t: TimeOfDay) => void;
+  onSetWeatherMode: (w: WeatherMode) => void;
   onToggleMute: () => void;
   onToggleHud: () => void;
   onToggleMap: () => void;
@@ -35,6 +43,9 @@ interface MetroHUDProps {
   onToggleDoors: () => void;
   onSoundHorn: () => void;
   onToggleAutopilot: () => void;
+  onToggleSpeedLock: () => void;
+  onAdjustSpeedLock: (delta: number) => void;
+  onToggleWiper: () => void;
   onSetSimSpeed: (s: 1 | 2 | 4) => void;
   onRestart: () => void;
 }
@@ -49,15 +60,20 @@ const NOTCHES = [
   { val: 3, label: '+3', title: 'Max Power' },
 ];
 
+const WEATHER_LABELS: Record<ActiveWeather, string> = {
+  sunny: 'Sunny',
+  sandstorm: 'Sandstorm',
+  'night-fog': 'Night-Fog',
+};
+
 export const MetroHUD: React.FC<MetroHUDProps> = ({
   telemetry,
   cameraMode,
-  timeOfDay,
   muted,
   hudCollapsed,
   mapOpen,
   onSetCameraMode,
-  onSetTimeOfDay,
+  onSetWeatherMode,
   onToggleMute,
   onToggleHud,
   onToggleMap,
@@ -65,6 +81,9 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
   onToggleDoors,
   onSoundHorn,
   onToggleAutopilot,
+  onToggleSpeedLock,
+  onAdjustSpeedLock,
+  onToggleWiper,
   onSetSimSpeed,
   onRestart,
 }) => {
@@ -95,6 +114,11 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
             <span className="font-mono-tabular text-xs font-medium text-amber-300">
               {distKm} / {TOTAL_ROUTE_KM.toFixed(1)} km
             </span>
+            <span className="text-slate-500" aria-hidden="true">·</span>
+            <span className="text-xs font-medium text-sky-300">
+              {WEATHER_LABELS[telemetry.activeWeather]}
+              {telemetry.weatherMode === 'auto' ? ' (Auto)' : ''}
+            </span>
           </div>
 
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-300">
@@ -115,7 +139,6 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
             </span>
           </div>
 
-          {/* Slim Route Progress Hairline */}
           <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-slate-800">
             <div
               className="h-full bg-red-500 transition-transform duration-150"
@@ -127,7 +150,7 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
           </div>
         </div>
 
-        {/* Top-Right View & Environment Controls */}
+        {/* Top-Right View & Dynamic Weather Controls */}
         <div className="pointer-events-auto flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-lg border border-white/10 bg-slate-950/88 p-1">
             {([
@@ -153,42 +176,50 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
           <div className="flex items-center rounded-lg border border-white/10 bg-slate-950/88 p-1">
             <button
               type="button"
-              onClick={() => onSetTimeOfDay('sunset')}
-              title="Sunset Lighting"
-              className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                timeOfDay === 'sunset'
-                  ? 'bg-amber-500 text-slate-950'
+              onClick={() => onSetWeatherMode('auto')}
+              className={`whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                telemetry.weatherMode === 'auto'
+                  ? 'bg-slate-200 text-slate-950'
                   : 'text-slate-300 hover:text-white'
               }`}
             >
-              <Sunset className="h-3.5 w-3.5" />
-              <span>Sunset</span>
+              Auto Cycle
             </button>
             <button
               type="button"
-              onClick={() => onSetTimeOfDay('day')}
-              title="Daytime Lighting"
-              className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                timeOfDay === 'day'
+              onClick={() => onSetWeatherMode('sunny')}
+              className={`flex items-center gap-1 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                telemetry.weatherMode === 'sunny'
                   ? 'bg-sky-400 text-slate-950'
                   : 'text-slate-300 hover:text-white'
               }`}
             >
               <Sun className="h-3.5 w-3.5" />
-              <span>Day</span>
+              <span>Sunny</span>
             </button>
             <button
               type="button"
-              onClick={() => onSetTimeOfDay('night')}
-              title="Night Lighting"
-              className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                timeOfDay === 'night'
+              onClick={() => onSetWeatherMode('sandstorm')}
+              className={`flex items-center gap-1 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                telemetry.weatherMode === 'sandstorm'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Wind className="h-3.5 w-3.5" />
+              <span>Sandstorm</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onSetWeatherMode('night-fog')}
+              className={`flex items-center gap-1 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                telemetry.weatherMode === 'night-fog'
                   ? 'bg-indigo-400 text-slate-950'
                   : 'text-slate-300 hover:text-white'
               }`}
             >
-              <Moon className="h-3.5 w-3.5" />
-              <span>Night</span>
+              <CloudFog className="h-3.5 w-3.5" />
+              <span>Night-Fog</span>
             </button>
           </div>
 
@@ -212,7 +243,7 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
         </div>
       </div>
 
-      {/* Station Docking & Passenger Boarding Strip (appears near stations) */}
+      {/* Station Docking & Passenger Boarding Strip */}
       {showDockingStrip && !telemetry.routeComplete && (
         <div className="pointer-events-auto mx-auto mt-2 flex flex-wrap items-center justify-center gap-4 rounded-xl border border-amber-400/30 bg-slate-950/90 px-5 py-2.5 shadow-xl">
           <div className="text-left">
@@ -257,7 +288,6 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
         </div>
       )}
 
-      {/* Spacer keeps 3D viewport center 100% clear */}
       <div className="flex-1" />
 
       {/* Route Complete Modal */}
@@ -329,9 +359,9 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
         </button>
 
         {!hudCollapsed && (
-          <div className="pointer-events-auto flex w-full max-w-[940px] flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-slate-950/90 px-5 py-3 shadow-2xl">
-            {/* Speedometer */}
-            <div className="flex items-baseline gap-3">
+          <div className="pointer-events-auto flex w-full max-w-[1060px] flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-slate-950/90 px-5 py-3 shadow-2xl">
+            {/* Speedometer & Speed Lock Control */}
+            <div className="flex items-center gap-4">
               <div>
                 <div className="flex items-baseline gap-1.5">
                   <span
@@ -347,6 +377,45 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
                   Limit {telemetry.speedLimitKmh} km/h
                   {telemetry.overspeeding ? ' · Overspeed' : ''}
                 </div>
+              </div>
+
+              <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-slate-900 p-1">
+                <button
+                  type="button"
+                  onClick={() => onAdjustSpeedLock(-5)}
+                  aria-label="Decrease Speed Lock"
+                  className="rounded px-1.5 py-1.5 text-slate-300 hover:bg-slate-800 hover:text-white"
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={onToggleSpeedLock}
+                  className={`flex items-center gap-1.5 whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                    telemetry.speedLockEnabled
+                      ? 'bg-emerald-500 text-slate-950'
+                      : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                  }`}
+                >
+                  {telemetry.speedLockEnabled ? (
+                    <Lock className="h-3.5 w-3.5" />
+                  ) : (
+                    <Unlock className="h-3.5 w-3.5" />
+                  )}
+                  <span className="font-mono-tabular">
+                    {telemetry.speedLockEnabled
+                      ? `Locked ${telemetry.speedLockKmh}`
+                      : `Lock ${telemetry.speedLockKmh}`}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onAdjustSpeedLock(5)}
+                  aria-label="Increase Speed Lock"
+                  className="rounded px-1.5 py-1.5 text-slate-300 hover:bg-slate-800 hover:text-white"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </button>
               </div>
             </div>
 
@@ -366,7 +435,7 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
                       type="button"
                       title={n.title}
                       onClick={() => onSetNotch(n.val)}
-                      className={`font-mono-tabular min-w-[40px] whitespace-nowrap shrink-0 rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                      className={`font-mono-tabular min-w-[38px] whitespace-nowrap shrink-0 rounded-md px-2 py-1.5 text-xs font-semibold transition-colors ${
                         active
                           ? activeClass
                           : 'text-slate-300 hover:bg-slate-800 hover:text-white'
@@ -378,12 +447,12 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
                 })}
               </div>
               <div className="text-[11px] text-slate-400">
-                W / S Throttle & Brake · Space Doors · B Horn
+                W/S Drive · L Speed Lock · Space Doors · V Wipers · B Horn
               </div>
             </div>
 
             {/* Action Controls */}
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
               <button
                 type="button"
                 onClick={onToggleDoors}
@@ -401,8 +470,20 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
 
               <button
                 type="button"
+                onClick={onToggleWiper}
+                className={`whitespace-nowrap shrink-0 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors ${
+                  telemetry.wiperActive
+                    ? 'bg-sky-500/20 text-sky-300 border border-sky-400/40'
+                    : 'border border-white/10 bg-slate-900 text-slate-300 hover:bg-slate-800'
+                }`}
+              >
+                Wipers
+              </button>
+
+              <button
+                type="button"
                 onClick={onSoundHorn}
-                className="whitespace-nowrap shrink-0 rounded-lg border border-white/10 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                className="whitespace-nowrap shrink-0 rounded-lg border border-white/10 bg-slate-900 px-2.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800"
               >
                 Horn
               </button>
@@ -410,7 +491,7 @@ export const MetroHUD: React.FC<MetroHUDProps> = ({
               <button
                 type="button"
                 onClick={onToggleAutopilot}
-                className={`whitespace-nowrap shrink-0 rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+                className={`whitespace-nowrap shrink-0 rounded-lg px-2.5 py-2 text-xs font-semibold transition-colors ${
                   telemetry.autopilot
                     ? 'bg-sky-500 text-slate-950 hover:bg-sky-400'
                     : 'border border-white/10 bg-slate-900 text-slate-300 hover:bg-slate-800'

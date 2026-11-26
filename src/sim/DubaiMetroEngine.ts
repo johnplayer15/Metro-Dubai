@@ -31,14 +31,15 @@ import {
 } from './track';
 
 export type CameraMode = 'cab' | 'chase' | 'drone';
-export type TimeOfDay = 'sunset' | 'day' | 'night';
+export type ActiveWeather = 'sunny' | 'sandstorm' | 'night-fog';
+export type WeatherMode = 'auto' | ActiveWeather;
 export type DoorPhase = 'closed' | 'opening' | 'open' | 'closing';
 
 export interface SimTelemetry {
   distanceM: number;
   speedKmh: number;
   speedLimitKmh: number;
-  notch: number; // -3 .. +3
+  notch: number;
   passengersOnboard: number;
   totalPassengersServed: number;
   lastBoarded: number;
@@ -48,7 +49,7 @@ export interface SimTelemetry {
   nextStation: StationDef;
   distToNextStationM: number;
   doorPhase: DoorPhase;
-  boardingProgress: number; // 0..1
+  boardingProgress: number;
   canOpenDoors: boolean;
   canDepart: boolean;
   stopErrorM: number | null;
@@ -57,6 +58,11 @@ export interface SimTelemetry {
   comfortPct: number;
   overspeeding: boolean;
   autopilot: boolean;
+  speedLockEnabled: boolean;
+  speedLockKmh: number;
+  weatherMode: WeatherMode;
+  activeWeather: ActiveWeather;
+  wiperActive: boolean;
   simSpeed: 1 | 2 | 4;
   routeComplete: boolean;
   elapsedSimSec: number;
@@ -68,6 +74,93 @@ interface LandmarkPlacement {
   yawOffset: number;
   mesh: THREE.Group;
 }
+
+interface WeatherPreset {
+  skyTop: THREE.Color;
+  skyMid: THREE.Color;
+  skyHorizon: THREE.Color;
+  sunDir: THREE.Vector3;
+  sunColor: THREE.Color;
+  sunIntensity: number;
+  hemiSky: THREE.Color;
+  hemiGround: THREE.Color;
+  hemiIntensity: number;
+  fogColor: THREE.Color;
+  fogDensity: number;
+  exposure: number;
+  starIntensity: number;
+  buildingEmissive: number;
+  headlightIntensity: number;
+  beamOpacity: number;
+  particleColor: THREE.Color;
+  particleOpacity: number;
+}
+
+const WEATHER_PRESETS: Record<ActiveWeather, WeatherPreset> = {
+  sunny: {
+    skyTop: new THREE.Color(0x1b6db5),
+    skyMid: new THREE.Color(0x6bb5f8),
+    skyHorizon: new THREE.Color(0xf4dec2),
+    sunDir: new THREE.Vector3(0.32, 0.62, -0.52).normalize(),
+    sunColor: new THREE.Color(0xfff5e0),
+    sunIntensity: 2.65,
+    hemiSky: new THREE.Color(0xdbeafe),
+    hemiGround: new THREE.Color(0xd9b382),
+    hemiIntensity: 1.05,
+    fogColor: new THREE.Color(0xc8dcf0),
+    fogDensity: 0.00052,
+    exposure: 1.04,
+    starIntensity: 0.0,
+    buildingEmissive: 0.08,
+    headlightIntensity: 0.9,
+    beamOpacity: 0.0,
+    particleColor: new THREE.Color(0xfde68a),
+    particleOpacity: 0.0,
+  },
+  sandstorm: {
+    skyTop: new THREE.Color(0x8c5a2b),
+    skyMid: new THREE.Color(0xc98a4b),
+    skyHorizon: new THREE.Color(0xdca86c),
+    sunDir: new THREE.Vector3(-0.45, 0.25, -0.75).normalize(),
+    sunColor: new THREE.Color(0xffc988),
+    sunIntensity: 1.45,
+    hemiSky: new THREE.Color(0xe6b884),
+    hemiGround: new THREE.Color(0x9e6b3b),
+    hemiIntensity: 0.95,
+    fogColor: new THREE.Color(0xcf9458),
+    fogDensity: 0.0041,
+    exposure: 0.98,
+    starIntensity: 0.0,
+    buildingEmissive: 0.35,
+    headlightIntensity: 2.6,
+    beamOpacity: 0.16,
+    particleColor: new THREE.Color(0xe6b173),
+    particleOpacity: 0.68,
+  },
+  'night-fog': {
+    skyTop: new THREE.Color(0x030712),
+    skyMid: new THREE.Color(0x0f1c38),
+    skyHorizon: new THREE.Color(0x1e2c42),
+    sunDir: new THREE.Vector3(-0.35, 0.42, -0.72).normalize(),
+    sunColor: new THREE.Color(0x94a3b8),
+    sunIntensity: 0.72,
+    hemiSky: new THREE.Color(0x1e3a5f),
+    hemiGround: new THREE.Color(0x0f172a),
+    hemiIntensity: 0.68,
+    fogColor: new THREE.Color(0x172336),
+    fogDensity: 0.0028,
+    exposure: 1.24,
+    starIntensity: 0.75,
+    buildingEmissive: 1.15,
+    headlightIntensity: 3.4,
+    beamOpacity: 0.22,
+    particleColor: new THREE.Color(0x94a3b8),
+    particleOpacity: 0.36,
+  },
+};
+
+const WEATHER_CYCLE: ActiveWeather[] = ['sunny', 'sandstorm', 'night-fog'];
+const WEATHER_CYCLE_PERIOD_SEC = 36;
 
 const _dummy = new THREE.Object3D();
 const _pose: TrackPose = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
@@ -108,15 +201,27 @@ export class DubaiMetroEngine {
   private textures: ProceduralTextureSet;
   private audio: MetroAudioEngine;
 
-  // Lighting, Sky & Atmosphere
+  // Lighting, Sky & Dynamic Weather
   private sunLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
   private fog: THREE.FogExp2;
   private skyMat!: THREE.ShaderMaterial;
   private skyDome!: THREE.Mesh;
-  private currentTimeOfDay: TimeOfDay = 'sunset';
+  private weatherMode: WeatherMode = 'auto';
+  private activeWeather: ActiveWeather = 'sunny';
+  private weatherTimerSec = 0;
+  private curSunDir = new THREE.Vector3(0.32, 0.62, -0.52).normalize();
+  private curFogColor = new THREE.Color(0xc8dcf0);
+  private curBuildingEmissive = 0.08;
+  private curBeamOpacity = 0.0;
 
-  // Building Materials (adjusted dynamically per TimeOfDay)
+  // Sandstorm / Night-Fog Particle Cloud
+  private readonly PARTICLE_COUNT = 1800;
+  private particlePositions!: Float32Array;
+  private particleGeo!: THREE.BufferGeometry;
+  private particleMat!: THREE.PointsMaterial;
+  private particleSystem!: THREE.Points;
+
   private buildingMats: THREE.MeshStandardMaterial[] = [];
 
   // Train & AI Train
@@ -125,7 +230,12 @@ export class DubaiMetroEngine {
   private aiTrainS = 1800;
   private leverAnimAngle = 0;
   private cabPitchSway = 0;
+  private cabRollSway = 0;
+  private prevYaw = 0;
+  private wiperManual = false;
+  private wiperPhase = 0;
   private lastDmiUpdateMs = 0;
+  private lastAuxUpdateMs = 0;
 
   // Stations & Landmarks
   private stationRigs: StationRig[] = [];
@@ -140,24 +250,39 @@ export class DubaiMetroEngine {
   private trackBedLeftInst!: THREE.InstancedMesh;
   private trackBedRightInst!: THREE.InstancedMesh;
   private steelRailInst!: THREE.InstancedMesh;
+  private signalMastInst!: THREE.InstancedMesh;
+  private signalLampInst!: THREE.InstancedMesh;
   private highwayInst!: THREE.InstancedMesh;
   private highwayMedianInst!: THREE.InstancedMesh;
+  private greenStripInst!: THREE.InstancedMesh;
   private streetLampInst!: THREE.InstancedMesh;
   private palmTrunkInst!: THREE.InstancedMesh;
   private palmCrownInst!: THREE.InstancedMesh;
-  private trafficInst!: THREE.InstancedMesh;
+  private trafficBodyInst!: THREE.InstancedMesh;
+  private trafficCabinInst!: THREE.InstancedMesh;
+  private trafficLightsInst!: THREE.InstancedMesh;
   private buildingCyanInst!: THREE.InstancedMesh;
   private buildingGoldInst!: THREE.InstancedMesh;
   private buildingDarkInst!: THREE.InstancedMesh;
+  private buildingCrownInst!: THREE.InstancedMesh;
+  private buildingSpireInst!: THREE.InstancedMesh;
   private desertGround!: THREE.Mesh;
   private gulfWater!: THREE.Mesh;
 
-  private trafficVehicles: { offsetS: number; laneX: number; speedMs: number }[] = [];
+  private trafficVehicles: {
+    offsetS: number;
+    laneX: number;
+    speedMs: number;
+    isBus: boolean;
+  }[] = [];
 
   // Simulation Physics & Game State
   private distanceM = 0;
   private velocityMs = 0;
   private notch = 0;
+  private continuousEffort = 0; // -1..+1 smooth blended effort
+  private speedLockEnabled = false;
+  private speedLockKmh = 85;
   private passengersOnboard = 0;
   private totalPassengersServed = 0;
   private lastBoarded = 0;
@@ -217,7 +342,7 @@ export class DubaiMetroEngine {
     });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 1.04;
     this.renderer.setPixelRatio(
       this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2)
     );
@@ -230,12 +355,12 @@ export class DubaiMetroEngine {
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.fog = new THREE.FogExp2(0xe2a97e, 0.00078);
+    this.fog = new THREE.FogExp2(0xc8dcf0, 0.00052);
     this.scene.fog = this.fog;
-    this.scene.background = new THREE.Color(0xe2a97e);
+    this.scene.background = new THREE.Color(0xc8dcf0);
 
     this.camera = new THREE.PerspectiveCamera(
-      62,
+      64,
       (container.clientWidth || 1280) / (container.clientHeight || 720),
       0.15,
       2800
@@ -245,10 +370,10 @@ export class DubaiMetroEngine {
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
 
-    this.hemiLight = new THREE.HemisphereLight(0x93c5fd, 0xd4a574, 0.88);
+    this.hemiLight = new THREE.HemisphereLight(0xdbeafe, 0xd9b382, 1.05);
     this.scene.add(this.hemiLight);
 
-    this.sunLight = new THREE.DirectionalLight(0xffd7a8, 2.2);
+    this.sunLight = new THREE.DirectionalLight(0xfff5e0, 2.65);
     this.sunLight.position.set(160, 140, 90);
     if (!this.isSoftwareGl) {
       this.sunLight.castShadow = true;
@@ -270,6 +395,7 @@ export class DubaiMetroEngine {
     this.textures = createProceduralTextures(maxAniso);
 
     this.initSkyDome();
+    this.initWeatherParticles();
     this.initGroundAndWater();
     this.initStreamedCorridor();
 
@@ -286,7 +412,8 @@ export class DubaiMetroEngine {
     this.pendingBoardTarget = 118;
     this.pendingAlightTarget = 0;
 
-    this.setTimeOfDay('sunset');
+    sampleTrackPose(0, _pose);
+    this.prevYaw = _pose.yaw;
 
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
     this.renderer.domElement.addEventListener('webglcontextrestored', this.handleContextRestored);
@@ -302,16 +429,17 @@ export class DubaiMetroEngine {
   }
 
   private initSkyDome(): void {
+    const sunny = WEATHER_PRESETS.sunny;
     this.skyMat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
       fog: false,
       uniforms: {
-        uTopColor: { value: new THREE.Color(0x274c77) },
-        uMidColor: { value: new THREE.Color(0xc97b5d) },
-        uHorizonColor: { value: new THREE.Color(0xf3b883) },
-        uSunDir: { value: new THREE.Vector3(-0.65, 0.16, -0.74).normalize() },
-        uSunColor: { value: new THREE.Color(0xfff1c9) },
+        uTopColor: { value: sunny.skyTop.clone() },
+        uMidColor: { value: sunny.skyMid.clone() },
+        uHorizonColor: { value: sunny.skyHorizon.clone() },
+        uSunDir: { value: sunny.sunDir.clone() },
+        uSunColor: { value: sunny.sunColor.clone() },
         uStarIntensity: { value: 0.0 },
       },
       vertexShader: `
@@ -339,12 +467,12 @@ export class DubaiMetroEngine {
         void main() {
           vec3 dir = normalize(vWorldDir);
           float h = clamp(dir.y, 0.0, 1.0);
-          vec3 sky = mix(uHorizonColor, uMidColor, smoothstep(0.0, 0.24, h));
-          sky = mix(sky, uTopColor, smoothstep(0.18, 0.78, h));
+          vec3 sky = mix(uHorizonColor, uMidColor, smoothstep(0.0, 0.26, h));
+          sky = mix(sky, uTopColor, smoothstep(0.18, 0.80, h));
 
           float sunDot = max(dot(dir, normalize(uSunDir)), 0.0);
           float sunDisc = smoothstep(0.9985, 0.9996, sunDot);
-          float sunHalo = pow(sunDot, 22.0) * 0.42;
+          float sunHalo = pow(sunDot, 22.0) * 0.38;
           sky += uSunColor * (sunDisc * 1.4 + sunHalo);
 
           if (uStarIntensity > 0.01 && h > 0.08) {
@@ -359,6 +487,32 @@ export class DubaiMetroEngine {
 
     this.skyDome = new THREE.Mesh(new THREE.SphereGeometry(2350, 32, 20), this.skyMat);
     this.scene.add(this.skyDome);
+  }
+
+  private initWeatherParticles(): void {
+    this.particlePositions = new Float32Array(this.PARTICLE_COUNT * 3);
+    for (let i = 0; i < this.PARTICLE_COUNT; i++) {
+      this.particlePositions[i * 3] = (Math.random() - 0.5) * 140;
+      this.particlePositions[i * 3 + 1] = 2 + Math.random() * 38;
+      this.particlePositions[i * 3 + 2] = -110 + Math.random() * 140;
+    }
+    this.particleGeo = new THREE.BufferGeometry();
+    this.particleGeo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(this.particlePositions, 3)
+    );
+    this.particleMat = new THREE.PointsMaterial({
+      map: this.textures.dustParticle,
+      color: 0xe6b173,
+      size: 2.8,
+      transparent: true,
+      opacity: 0.0,
+      depthWrite: false,
+      sizeAttenuation: true,
+    });
+    this.particleSystem = new THREE.Points(this.particleGeo, this.particleMat);
+    this.particleSystem.frustumCulled = false;
+    this.scene.add(this.particleSystem);
   }
 
   private handleContextLost = (e: Event) => {
@@ -434,7 +588,6 @@ export class DubaiMetroEngine {
     this.viaductDeckInst.receiveShadow = true;
     this.scene.add(this.viaductDeckInst);
 
-    // Concrete safety parapet walls on both edges of the viaduct
     const parapetGeo = new THREE.BoxGeometry(0.32, 0.95, this.SEG_LEN + 0.6);
     this.viaductParapetInst = new THREE.InstancedMesh(parapetGeo, concreteMat, this.SEG_COUNT * 2);
     this.viaductParapetInst.frustumCulled = false;
@@ -445,7 +598,6 @@ export class DubaiMetroEngine {
     this.viaductPierInst.frustumCulled = false;
     this.scene.add(this.viaductPierInst);
 
-    // Sleepered Track Beds (Player track x=0, Opposite track x=+4.6)
     const bedGeo = new THREE.PlaneGeometry(2.5, this.SEG_LEN + 0.5);
     bedGeo.rotateX(-Math.PI * 0.5);
     this.trackBedLeftInst = new THREE.InstancedMesh(bedGeo, trackBedMat, this.SEG_COUNT);
@@ -456,13 +608,24 @@ export class DubaiMetroEngine {
     this.trackBedRightInst.frustumCulled = false;
     this.scene.add(this.trackBedRightInst);
 
-    // 4 gleaming steel running rails (2 per track)
     const railHeadGeo = new THREE.BoxGeometry(0.09, 0.14, this.SEG_LEN + 0.5);
     this.steelRailInst = new THREE.InstancedMesh(railHeadGeo, steelRailMat, this.SEG_COUNT * 4);
     this.steelRailInst.frustumCulled = false;
     this.scene.add(this.steelRailInst);
 
-    // Sheikh Zayed Road 12-lane Expressway
+    // Trackside ATP Block Signals
+    const mastGeo = new THREE.CylinderGeometry(0.08, 0.1, 3.4, 6);
+    const mastMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.7, roughness: 0.35 });
+    this.signalMastInst = new THREE.InstancedMesh(mastGeo, mastMat, 16);
+    this.signalMastInst.frustumCulled = false;
+    this.scene.add(this.signalMastInst);
+
+    const lampSigGeo = new THREE.SphereGeometry(0.24, 8, 8);
+    const lampSigMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    this.signalLampInst = new THREE.InstancedMesh(lampSigGeo, lampSigMat, 16);
+    this.signalLampInst.frustumCulled = false;
+    this.scene.add(this.signalLampInst);
+
     const roadGeo = new THREE.PlaneGeometry(48, this.SEG_LEN + 0.8);
     roadGeo.rotateX(-Math.PI * 0.5);
     this.highwayInst = new THREE.InstancedMesh(roadGeo, roadMat, this.SEG_COUNT);
@@ -475,11 +638,18 @@ export class DubaiMetroEngine {
     this.highwayMedianInst.frustumCulled = false;
     this.scene.add(this.highwayMedianInst);
 
+    // Landscaped Green Boulevard Strips
+    const greenGeo = new THREE.BoxGeometry(6.5, 0.18, this.SEG_LEN + 0.6);
+    const greenMat = new THREE.MeshStandardMaterial({ color: 0x3f6212, roughness: 0.9 });
+    this.greenStripInst = new THREE.InstancedMesh(greenGeo, greenMat, this.SEG_COUNT * 2);
+    this.greenStripInst.frustumCulled = false;
+    this.scene.add(this.greenStripInst);
+
     const lampGeo = new THREE.CylinderGeometry(0.18, 0.25, 10.5, 6);
     const lampMat = new THREE.MeshStandardMaterial({
       color: 0xcbd5e1,
       emissive: 0xfef08a,
-      emissiveIntensity: 0.55,
+      emissiveIntensity: 0.75,
       metalness: 0.6,
       roughness: 0.35,
     });
@@ -499,31 +669,60 @@ export class DubaiMetroEngine {
     this.palmCrownInst.frustumCulled = false;
     this.scene.add(this.palmCrownInst);
 
-    const carGeo = new THREE.BoxGeometry(2.05, 1.35, 4.5);
-    const carMat = new THREE.MeshStandardMaterial({
+    // Composite Multi-Part Highway Traffic (Chassis + Glass Cabin + Glowing Headlights/Taillights)
+    const trafficCount = 84;
+    const bodyGeo = new THREE.BoxGeometry(1, 1, 1);
+    const bodyMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      metalness: 0.62,
+      metalness: 0.65,
       roughness: 0.25,
     });
-    const trafficCount = 84;
-    this.trafficInst = new THREE.InstancedMesh(carGeo, carMat, trafficCount);
-    this.trafficInst.frustumCulled = false;
-    const carPalette = [0xf8fafc, 0x0f172a, 0x94a3b8, 0x0284c7, 0xdc2626, 0xd97706];
+    this.trafficBodyInst = new THREE.InstancedMesh(bodyGeo, bodyMat, trafficCount);
+    this.trafficBodyInst.frustumCulled = false;
+    this.scene.add(this.trafficBodyInst);
+
+    const cabinMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a,
+      metalness: 0.85,
+      roughness: 0.14,
+    });
+    this.trafficCabinInst = new THREE.InstancedMesh(bodyGeo, cabinMat, trafficCount);
+    this.trafficCabinInst.frustumCulled = false;
+    this.scene.add(this.trafficCabinInst);
+
+    const tLightMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    this.trafficLightsInst = new THREE.InstancedMesh(bodyGeo, tLightMat, trafficCount);
+    this.trafficLightsInst.frustumCulled = false;
+    this.scene.add(this.trafficLightsInst);
+
+    const carPalette = [
+      0xf8fafc, // White SUV
+      0xe2e8f0, // Silver Sedan
+      0x1e293b, // Black Luxury
+      0xf5f5f4, // Cream Taxi
+      0x0284c7, // Blue Coupe
+      0xdc2626, // RTA Bus / Red Sports
+    ];
     const lanes = [-17.5, -12.5, -7.5, 7.5, 12.5, 17.5];
     for (let i = 0; i < trafficCount; i++) {
       const laneIdx = i % lanes.length;
       const dir = laneIdx < 3 ? -1 : 1;
+      const isBus = i % 11 === 0;
       this.trafficVehicles.push({
         offsetS: -280 + (i / trafficCount) * 1450,
         laneX: 28 + lanes[laneIdx],
-        speedMs: dir * (22 + seededRand(i + 10) * 14),
+        speedMs: dir * ((isBus ? 18 : 24) + seededRand(i + 10) * 12),
+        isBus,
       });
-      _color.setHex(carPalette[i % carPalette.length]);
-      this.trafficInst.setColorAt(i, _color);
+      _color.setHex(isBus ? 0xdc2626 : carPalette[i % carPalette.length]);
+      this.trafficBodyInst.setColorAt(i, _color);
+      _color.setHex(dir < 0 ? 0xfef9c3 : 0xef4444);
+      this.trafficLightsInst.setColorAt(i, _color);
     }
-    if (this.trafficInst.instanceColor) this.trafficInst.instanceColor.needsUpdate = true;
-    this.scene.add(this.trafficInst);
+    if (this.trafficBodyInst.instanceColor) this.trafficBodyInst.instanceColor.needsUpdate = true;
+    if (this.trafficLightsInst.instanceColor) this.trafficLightsInst.instanceColor.needsUpdate = true;
 
+    // Composite Dubai Skyscrapers (Main Shaft + Stepped Crown Setback + Rooftop Spire)
     const bGeo = new THREE.BoxGeometry(1, 1, 1);
     const makeBuildingInst = (tex: THREE.CanvasTexture, emissiveGlow: number) => {
       const mat = new THREE.MeshStandardMaterial({
@@ -533,8 +732,8 @@ export class DubaiMetroEngine {
         emissive: 0xfef08a,
         emissiveMap: this.textures.facadeEmissive,
         emissiveIntensity: emissiveGlow,
-        metalness: 0.78,
-        roughness: 0.18,
+        metalness: 0.8,
+        roughness: 0.16,
       });
       this.buildingMats.push(mat);
       const inst = new THREE.InstancedMesh(bGeo, mat, 52);
@@ -542,9 +741,30 @@ export class DubaiMetroEngine {
       this.scene.add(inst);
       return inst;
     };
-    this.buildingCyanInst = makeBuildingInst(this.textures.facadeCyan, 0.3);
-    this.buildingGoldInst = makeBuildingInst(this.textures.facadeGold, 0.32);
-    this.buildingDarkInst = makeBuildingInst(this.textures.facadeDarkLit, 0.65);
+    this.buildingCyanInst = makeBuildingInst(this.textures.facadeCyan, 0.2);
+    this.buildingGoldInst = makeBuildingInst(this.textures.facadeGold, 0.22);
+    this.buildingDarkInst = makeBuildingInst(this.textures.facadeDarkLit, 0.5);
+
+    const towerCrownMat = new THREE.MeshStandardMaterial({
+      color: 0xcbd5e1,
+      metalness: 0.85,
+      roughness: 0.22,
+    });
+    this.buildingCrownInst = new THREE.InstancedMesh(bGeo, towerCrownMat, 156);
+    this.buildingCrownInst.frustumCulled = false;
+    this.scene.add(this.buildingCrownInst);
+
+    const spireGeo = new THREE.CylinderGeometry(0.18, 0.65, 1, 6);
+    const spireMat = new THREE.MeshStandardMaterial({
+      color: 0xe2e8f0,
+      emissive: 0x38bdf8,
+      emissiveIntensity: 0.6,
+      metalness: 0.9,
+      roughness: 0.18,
+    });
+    this.buildingSpireInst = new THREE.InstancedMesh(spireGeo, spireMat, 156);
+    this.buildingSpireInst.frustumCulled = false;
+    this.scene.add(this.buildingSpireInst);
   }
 
   private initStationsAndLandmarks(maxAniso: number): void {
@@ -575,7 +795,6 @@ export class DubaiMetroEngine {
     addLandmark(29950, -110, 0, createCayanTower(this.textures));
     addLandmark(42250, -125, 0.1, createJebelAliPort());
 
-    // Highway overhead directional gantries along Sheikh Zayed Road
     for (let gs = 1800; gs < TOTAL_ROUTE_M; gs += 3200) {
       addLandmark(gs, 28, 0, createHighwayGantry(this.textures));
     }
@@ -593,77 +812,50 @@ export class DubaiMetroEngine {
     this.syncTrainCockpitVisibility();
   }
 
-  public setTimeOfDay(tod: TimeOfDay): void {
-    this.currentTimeOfDay = tod;
-    if (tod === 'sunset') {
-      const sky = 0xd98a5f;
-      this.scene.background = new THREE.Color(sky);
-      this.fog.color.setHex(sky);
-      this.fog.density = 0.00072;
-      this.sunLight.color.setHex(0xffcca0);
-      this.sunLight.intensity = 2.35;
-      this.hemiLight.color.setHex(0x93c5fd);
-      this.hemiLight.groundColor.setHex(0xc48b5c);
-      this.hemiLight.intensity = 0.9;
-      this.renderer.toneMappingExposure = 1.08;
-      this.trainRig.headlightMat.emissiveIntensity = 1.9;
-      this.skyMat.uniforms.uTopColor.value.setHex(0x284b7a);
-      this.skyMat.uniforms.uMidColor.value.setHex(0xc97b5d);
-      this.skyMat.uniforms.uHorizonColor.value.setHex(0xf3b883);
-      this.skyMat.uniforms.uSunDir.value.set(-0.65, 0.14, -0.75).normalize();
-      this.skyMat.uniforms.uSunColor.value.setHex(0xffe9b5);
-      this.skyMat.uniforms.uStarIntensity.value = 0.0;
-      this.buildingMats.forEach((m, idx) => (m.emissiveIntensity = idx === 2 ? 0.55 : 0.25));
-    } else if (tod === 'day') {
-      const sky = 0x9bd0f7;
-      this.scene.background = new THREE.Color(sky);
-      this.fog.color.setHex(sky);
-      this.fog.density = 0.00058;
-      this.sunLight.color.setHex(0xfff9ee);
-      this.sunLight.intensity = 2.65;
-      this.hemiLight.color.setHex(0xe0f2fe);
-      this.hemiLight.groundColor.setHex(0xd4b483);
-      this.hemiLight.intensity = 1.08;
-      this.renderer.toneMappingExposure = 1.02;
-      this.trainRig.headlightMat.emissiveIntensity = 0.9;
-      this.skyMat.uniforms.uTopColor.value.setHex(0x1d6fb8);
-      this.skyMat.uniforms.uMidColor.value.setHex(0x60a5fa);
-      this.skyMat.uniforms.uHorizonColor.value.setHex(0xdbeafe);
-      this.skyMat.uniforms.uSunDir.value.set(0.35, 0.65, -0.45).normalize();
-      this.skyMat.uniforms.uSunColor.value.setHex(0xffffff);
-      this.skyMat.uniforms.uStarIntensity.value = 0.0;
-      this.buildingMats.forEach((m) => (m.emissiveIntensity = 0.06));
+  public setWeatherMode(mode: WeatherMode): void {
+    this.weatherMode = mode;
+    if (mode !== 'auto') {
+      this.activeWeather = mode;
     } else {
-      const sky = 0x070e1f;
-      this.scene.background = new THREE.Color(sky);
-      this.fog.color.setHex(sky);
-      this.fog.density = 0.00086;
-      this.sunLight.color.setHex(0x7c93b8);
-      this.sunLight.intensity = 0.85;
-      this.hemiLight.color.setHex(0x1e3a5f);
-      this.hemiLight.groundColor.setHex(0x0f172a);
-      this.hemiLight.intensity = 0.72;
-      this.renderer.toneMappingExposure = 1.25;
-      this.trainRig.headlightMat.emissiveIntensity = 3.2;
-      this.skyMat.uniforms.uTopColor.value.setHex(0x020617);
-      this.skyMat.uniforms.uMidColor.value.setHex(0x0c1936);
-      this.skyMat.uniforms.uHorizonColor.value.setHex(0x1e293b);
-      this.skyMat.uniforms.uSunDir.value.set(-0.4, 0.45, -0.7).normalize();
-      this.skyMat.uniforms.uSunColor.value.setHex(0xcbd5e1);
-      this.skyMat.uniforms.uStarIntensity.value = 0.95;
-      this.buildingMats.forEach((m, idx) => (m.emissiveIntensity = idx === 2 ? 1.15 : 0.65));
+      this.weatherTimerSec = 0;
     }
   }
 
-  public getTimeOfDay(): TimeOfDay {
-    return this.currentTimeOfDay;
+  public toggleSpeedLock(): void {
+    this.audio.init();
+    this.speedLockEnabled = !this.speedLockEnabled;
+    if (this.speedLockEnabled) {
+      const currentKmh = Math.round(this.velocityMs * 3.6);
+      const limitKmh = getSpeedLimitAt(this.distanceM, this.nextStationIdx);
+      this.speedLockKmh = THREE.MathUtils.clamp(
+        currentKmh >= 20 ? currentKmh : Math.min(limitKmh, 85),
+        20,
+        110
+      );
+      if (this.autopilot) this.autopilot = false;
+    }
+  }
+
+  public adjustSpeedLock(deltaKmh: number): void {
+    this.audio.init();
+    this.speedLockKmh = THREE.MathUtils.clamp(this.speedLockKmh + deltaKmh, 20, 110);
+    if (!this.speedLockEnabled) {
+      this.speedLockEnabled = true;
+      if (this.autopilot) this.autopilot = false;
+    }
+  }
+
+  public toggleWiper(): void {
+    this.wiperManual = !this.wiperManual;
   }
 
   public setNotch(n: number): void {
     this.audio.init();
     this.notch = THREE.MathUtils.clamp(Math.round(n), -3, 3);
-    if (this.autopilot && this.notch !== 0) {
-      this.autopilot = false;
+    if (this.autopilot && this.notch !== 0) this.autopilot = false;
+    if (this.speedLockEnabled && this.notch < 0) {
+      // Manual braking disengages Speed Lock safely
+      this.speedLockEnabled = false;
     }
   }
 
@@ -674,6 +866,7 @@ export class DubaiMetroEngine {
   public setAutopilot(enabled: boolean): void {
     this.audio.init();
     this.autopilot = enabled;
+    if (enabled) this.speedLockEnabled = false;
   }
 
   public setSimSpeed(speed: 1 | 2 | 4): void {
@@ -707,6 +900,8 @@ export class DubaiMetroEngine {
     this.distanceM = 0;
     this.velocityMs = 0;
     this.notch = 0;
+    this.continuousEffort = 0;
+    this.speedLockEnabled = false;
     this.passengersOnboard = 0;
     this.totalPassengersServed = 0;
     this.lastBoarded = 0;
@@ -745,6 +940,7 @@ export class DubaiMetroEngine {
     this.boardingTimer = 0;
     this.boardedSoFarThisStop = 0;
     this.alightedSoFarThisStop = 0;
+    this.speedLockEnabled = false;
     this.audio.playDoorChime(true);
 
     const isNewVisit = !this.visitedStations.has(stationIdx);
@@ -812,6 +1008,120 @@ export class DubaiMetroEngine {
     this.lastBoarded = this.boardedSoFarThisStop;
   }
 
+  private updateWeather(dt: number): void {
+    if (this.weatherMode === 'auto') {
+      this.weatherTimerSec += dt;
+      const idx =
+        Math.floor(this.weatherTimerSec / WEATHER_CYCLE_PERIOD_SEC) %
+        WEATHER_CYCLE.length;
+      this.activeWeather = WEATHER_CYCLE[idx];
+    } else {
+      this.activeWeather = this.weatherMode;
+    }
+
+    const target = WEATHER_PRESETS[this.activeWeather];
+    const rate = 1 - Math.exp(-0.9 * dt);
+
+    (this.skyMat.uniforms.uTopColor.value as THREE.Color).lerp(target.skyTop, rate);
+    (this.skyMat.uniforms.uMidColor.value as THREE.Color).lerp(target.skyMid, rate);
+    (this.skyMat.uniforms.uHorizonColor.value as THREE.Color).lerp(target.skyHorizon, rate);
+    (this.skyMat.uniforms.uSunColor.value as THREE.Color).lerp(target.sunColor, rate);
+    this.curSunDir.lerp(target.sunDir, rate).normalize();
+    (this.skyMat.uniforms.uSunDir.value as THREE.Vector3).copy(this.curSunDir);
+    this.skyMat.uniforms.uStarIntensity.value = THREE.MathUtils.lerp(
+      this.skyMat.uniforms.uStarIntensity.value as number,
+      target.starIntensity,
+      rate
+    );
+
+    this.curFogColor.lerp(target.fogColor, rate);
+    this.fog.color.copy(this.curFogColor);
+    (this.scene.background as THREE.Color).copy(this.curFogColor);
+    this.fog.density = THREE.MathUtils.lerp(this.fog.density, target.fogDensity, rate);
+
+    this.sunLight.color.lerp(target.sunColor, rate);
+    this.sunLight.intensity = THREE.MathUtils.lerp(this.sunLight.intensity, target.sunIntensity, rate);
+    this.hemiLight.color.lerp(target.hemiSky, rate);
+    this.hemiLight.groundColor.lerp(target.hemiGround, rate);
+    this.hemiLight.intensity = THREE.MathUtils.lerp(this.hemiLight.intensity, target.hemiIntensity, rate);
+    this.renderer.toneMappingExposure = THREE.MathUtils.lerp(
+      this.renderer.toneMappingExposure,
+      target.exposure,
+      rate
+    );
+
+    this.curBuildingEmissive = THREE.MathUtils.lerp(
+      this.curBuildingEmissive,
+      target.buildingEmissive,
+      rate
+    );
+    for (let i = 0; i < this.buildingMats.length; i++) {
+      this.buildingMats[i].emissiveIntensity =
+        this.curBuildingEmissive * (i === 2 ? 1.4 : 0.8);
+    }
+
+    this.trainRig.headlightMat.emissiveIntensity = THREE.MathUtils.lerp(
+      this.trainRig.headlightMat.emissiveIntensity,
+      target.headlightIntensity,
+      rate
+    );
+    this.curBeamOpacity = THREE.MathUtils.lerp(
+      this.curBeamOpacity,
+      target.beamOpacity,
+      rate
+    );
+    this.trainRig.headlightBeamMat.opacity = this.curBeamOpacity;
+
+    // Update blowing sand / drifting night mist particles
+    this.particleMat.color.lerp(target.particleColor, rate);
+    this.particleMat.opacity = THREE.MathUtils.lerp(
+      this.particleMat.opacity,
+      target.particleOpacity,
+      rate
+    );
+
+    if (this.particleMat.opacity > 0.02) {
+      const windX = this.activeWeather === 'sandstorm' ? -24 : -3;
+      const windZ = this.velocityMs * this.simSpeed + (this.activeWeather === 'sandstorm' ? 14 : 2);
+      const posAttr = this.particleGeo.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < this.PARTICLE_COUNT; i++) {
+        let px = this.particlePositions[i * 3] + windX * dt;
+        let py = this.particlePositions[i * 3 + 1] + Math.sin(i + this.elapsedSimSec * 2) * dt * 1.4;
+        let pz = this.particlePositions[i * 3 + 2] + windZ * dt;
+
+        if (px < -70) px += 140;
+        if (px > 70) px -= 140;
+        if (py < 1) py = 36;
+        if (py > 40) py = 2;
+        if (pz > 35) pz -= 140;
+        if (pz < -105) pz += 140;
+
+        this.particlePositions[i * 3] = px;
+        this.particlePositions[i * 3 + 1] = py;
+        this.particlePositions[i * 3 + 2] = pz;
+      }
+      posAttr.needsUpdate = true;
+    }
+
+    // Windshield wiper sweeps automatically in Sandstorm / Night-Fog
+    const wiperRunning =
+      this.wiperManual ||
+      this.activeWeather === 'sandstorm' ||
+      this.activeWeather === 'night-fog';
+    if (wiperRunning) {
+      this.wiperPhase += dt * (this.activeWeather === 'sandstorm' ? 4.8 : 2.6);
+      this.trainRig.cockpitWiperPivot.rotation.z =
+        0.55 + Math.sin(this.wiperPhase) * 0.72;
+    } else {
+      this.trainRig.cockpitWiperPivot.rotation.z = THREE.MathUtils.damp(
+        this.trainRig.cockpitWiperPivot.rotation.z,
+        1.28,
+        6,
+        dt
+      );
+    }
+  }
+
   private updatePhysics(dt: number): void {
     const simDt = dt * this.simSpeed;
     this.elapsedSimSec += simDt;
@@ -832,9 +1142,7 @@ export class DubaiMetroEngine {
         this.boardedSoFarThisStop = targetBoard;
         this.lastBoarded = targetBoard;
       }
-      if (frac >= 1) {
-        this.initialBoardingDone = true;
-      }
+      if (frac >= 1) this.initialBoardingDone = true;
     }
 
     if (this.doorPhase === 'opening') {
@@ -902,25 +1210,65 @@ export class DubaiMetroEngine {
       }
     }
 
+    sampleTrackPose(this.distanceM, _pose);
+
     if (this.doorPhase !== 'closed') {
       this.velocityMs = 0;
+      this.continuousEffort = 0;
       if (this.notch > 0) this.notch = 0;
     } else {
-      let accel = 0;
-      if (this.notch === 3) accel = 1.25;
-      else if (this.notch === 2) accel = 0.85;
-      else if (this.notch === 1) accel = 0.45;
-      else if (this.notch === 0) accel = -0.05;
-      else if (this.notch === -1) accel = -0.95;
-      else if (this.notch === -2) accel = -1.65;
-      else if (this.notch === -3) {
-        accel = -2.8;
+      // Determine target effort (-1..+1): Speed Lock PID or Master Controller Notch
+      let targetEffort = this.notch / 3;
+      if (this.speedLockEnabled && !this.autopilot) {
+        const targetVelMs = this.speedLockKmh / 3.6;
+        const velErr = targetVelMs - this.velocityMs;
+        targetEffort = THREE.MathUtils.clamp(velErr * 0.35, -0.65, 1.0);
+        this.notch =
+          targetEffort > 0.75
+            ? 3
+            : targetEffort > 0.4
+            ? 2
+            : targetEffort > 0.12
+            ? 1
+            : targetEffort < -0.4
+            ? -2
+            : targetEffort < -0.12
+            ? -1
+            : 0;
+      }
+
+      // Realistic traction & braking response lag (no instant jerky snapping)
+      this.continuousEffort = THREE.MathUtils.damp(
+        this.continuousEffort,
+        targetEffort,
+        5.5,
+        simDt
+      );
+
+      // Realistic rail physics:
+      // 1. Tractive force tapers at high speed (constant power limit above ~55 km/h)
+      const speedKmh = this.velocityMs * 3.6;
+      const speedPowerFactor = speedKmh > 55 ? Math.max(0.58, 55 / speedKmh * 0.95) : 1.0;
+
+      let driveAccel = 0;
+      if (this.continuousEffort >= 0) {
+        driveAccel = this.continuousEffort * 1.32 * speedPowerFactor;
+      } else if (this.notch === -3) {
+        driveAccel = -3.05; // Emergency friction + magnetic track brake
         if (this.velocityMs > 4) {
           this.comfortPct = Math.max(40, this.comfortPct - dt * 6);
         }
+      } else {
+        driveAccel = this.continuousEffort * 1.85; // Blended regenerative + pneumatic
       }
 
-      this.velocityMs += accel * simDt;
+      // 2. Viaduct grade gravity + quadratic aerodynamic drag + bearing rolling resistance
+      const gradeForce = -9.81 * Math.sin(_pose.pitch);
+      const aeroDrag = 0.00052 * this.velocityMs * this.velocityMs;
+      const rollingRes = this.velocityMs > 0.05 ? 0.025 : 0;
+
+      const netAccel = driveAccel + gradeForce - aeroDrag - rollingRes;
+      this.velocityMs += netAccel * simDt;
       if (this.velocityMs < 0) this.velocityMs = 0;
       const maxVelMs = 115 / 3.6;
       if (this.velocityMs > maxVelMs) this.velocityMs = maxVelMs;
@@ -949,13 +1297,20 @@ export class DubaiMetroEngine {
       this.comfortPct = Math.min(100, this.comfortPct + dt * 0.4);
     }
 
-    // Smooth cockpit suspension pitch sway & lever tilt
+    // Suspension pitch, centrifugal curve roll, and lever damping
     const targetLever = -this.notch * 0.16;
     this.leverAnimAngle = THREE.MathUtils.damp(this.leverAnimAngle, targetLever, 12, dt || 0.016);
-    const targetPitchSway = this.doorPhase === 'closed' ? this.notch * 0.0045 : 0;
+    const targetPitchSway = this.doorPhase === 'closed' ? this.continuousEffort * 0.005 : 0;
     this.cabPitchSway = THREE.MathUtils.damp(this.cabPitchSway, targetPitchSway, 6, dt || 0.016);
 
-    this.audio.updateMotion(speedKmh, this.notch / 3);
+    const yawRate = dt > 0.001 ? (_pose.yaw - this.prevYaw) / dt : 0;
+    this.prevYaw = _pose.yaw;
+    const targetRoll = THREE.MathUtils.clamp(yawRate * this.velocityMs * 0.0022, -0.025, 0.025);
+    this.cabRollSway = THREE.MathUtils.damp(this.cabRollSway, targetRoll, 5, dt || 0.016);
+
+    this.trainRig.speedLockLampMat.emissiveIntensity = this.speedLockEnabled ? 2.2 : 0.0;
+
+    this.audio.updateMotion(speedKmh, this.continuousEffort);
   }
 
   private updateSceneTransforms(dt: number): void {
@@ -964,32 +1319,61 @@ export class DubaiMetroEngine {
     const oz = _pose.z;
 
     this.skyDome.position.set(0, 0, 0);
+    this.particleSystem.position.set(0, _pose.y, 0);
     this.desertGround.position.set(0, -0.15, 0);
     this.textures.desertSand.offset.set(ox * 0.012, -oz * 0.012);
     this.gulfWater.position.set(-1580, -0.05, 0);
     this.textures.waterRipple.offset.y += (dt || 0.016) * 0.04;
 
-    this.sunLight.position.set(160, 140, 90);
+    this.sunLight.position.set(
+      this.curSunDir.x * 220,
+      Math.max(45, this.curSunDir.y * 220),
+      this.curSunDir.z * 220
+    );
     this.sunLight.target.position.set(0, 10, -40);
 
-    this.trainRig.group.position.set(0, _pose.y, 0);
-    this.trainRig.group.rotation.set(_pose.pitch + this.cabPitchSway, _pose.yaw, 0, 'YXZ');
+    // Subtle high-speed rail vibration in cockpit
+    const vib =
+      this.velocityMs > 8
+        ? Math.sin(performance.now() * 0.055) * 0.0025 * (this.velocityMs / 30)
+        : 0;
 
-    // Animate 3D cockpit lever & live DMI display
+    this.trainRig.group.position.set(0, _pose.y + vib, 0);
+    this.trainRig.group.rotation.set(
+      _pose.pitch + this.cabPitchSway,
+      _pose.yaw,
+      this.cabRollSway,
+      'YXZ'
+    );
+
     this.trainRig.cockpitLeverPivot.rotation.x = this.leverAnimAngle;
     const nowMs = performance.now();
-    if (this.cameraMode === 'cab' && this.trainRig.dmi && nowMs - this.lastDmiUpdateMs > 85) {
-      this.lastDmiUpdateMs = nowMs;
-      const nextSt = DUBAI_STATIONS[this.nextStationIdx];
-      this.trainRig.dmi.update(
-        this.velocityMs * 3.6,
-        getSpeedLimitAt(this.distanceM, this.nextStationIdx),
-        this.notch,
-        nextSt.code,
-        nextSt.name,
-        Math.max(0, nextSt.distanceM - this.distanceM),
-        this.doorPhase !== 'closed'
-      );
+    if (this.cameraMode === 'cab') {
+      if (this.trainRig.dmi && nowMs - this.lastDmiUpdateMs > 85) {
+        this.lastDmiUpdateMs = nowMs;
+        const nextSt = DUBAI_STATIONS[this.nextStationIdx];
+        this.trainRig.dmi.update(
+          this.velocityMs * 3.6,
+          getSpeedLimitAt(this.distanceM, this.nextStationIdx),
+          this.notch,
+          nextSt.code,
+          nextSt.name,
+          Math.max(0, nextSt.distanceM - this.distanceM),
+          this.doorPhase !== 'closed',
+          this.speedLockEnabled,
+          this.speedLockKmh
+        );
+      }
+      if (this.trainRig.aux && nowMs - this.lastAuxUpdateMs > 180) {
+        this.lastAuxUpdateMs = nowMs;
+        this.trainRig.aux.update(
+          this.activeWeather,
+          this.passengersOnboard,
+          TRAIN_MAX_CAPACITY,
+          Math.round(this.comfortPct),
+          Math.tan(_pose.pitch) * 100
+        );
+      }
     }
 
     const slideOffset = this.doorOpenAmount * 0.85;
@@ -1018,6 +1402,7 @@ export class DubaiMetroEngine {
     let palmIdx = 0;
     let parapetIdx = 0;
     let railIdx = 0;
+    let greenIdx = 0;
 
     for (let i = 0; i < this.SEG_COUNT; i++) {
       const segS = (baseSegment + i) * this.SEG_LEN;
@@ -1027,14 +1412,12 @@ export class DubaiMetroEngine {
       const cosY = Math.cos(_poseNext.yaw);
       const sinY = Math.sin(_poseNext.yaw);
 
-      // Viaduct Deck
       _dummy.position.set(rx + cosY * 2.3, _poseNext.y - 0.65, rz - sinY * 2.3);
       _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
       _dummy.scale.set(1, 1, 1);
       _dummy.updateMatrix();
       this.viaductDeckInst.setMatrixAt(i, _dummy.matrix);
 
-      // Viaduct Parapet Walls (Left -2.8m, Right +7.4m)
       for (const px of [-2.8, 7.4]) {
         _dummy.position.set(rx + cosY * px, _poseNext.y + 0.45, rz - sinY * px);
         _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
@@ -1043,14 +1426,12 @@ export class DubaiMetroEngine {
         this.viaductParapetInst.setMatrixAt(parapetIdx++, _dummy.matrix);
       }
 
-      // Viaduct Pier
       _dummy.position.set(rx + cosY * 2.3, (_poseNext.y - 1.2) * 0.5, rz - sinY * 2.3);
       _dummy.rotation.set(0, _poseNext.yaw, 0);
       _dummy.scale.set(1, (_poseNext.y - 1.0) / 10.5, 1);
       _dummy.updateMatrix();
       this.viaductPierInst.setMatrixAt(i, _dummy.matrix);
 
-      // Sleepered Track Beds
       _dummy.position.set(rx, _poseNext.y + 0.03, rz);
       _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
       _dummy.scale.set(1, 1, 1);
@@ -1061,7 +1442,6 @@ export class DubaiMetroEngine {
       _dummy.updateMatrix();
       this.trackBedRightInst.setMatrixAt(i, _dummy.matrix);
 
-      // 4 Individual Steel Running Rails
       for (const railOffset of [-0.72, 0.72, 4.6 - 0.72, 4.6 + 0.72]) {
         _dummy.position.set(rx + cosY * railOffset, _poseNext.y + 0.1, rz - sinY * railOffset);
         _dummy.rotation.set(_poseNext.pitch, _poseNext.yaw, 0, 'YXZ');
@@ -1070,7 +1450,6 @@ export class DubaiMetroEngine {
         this.steelRailInst.setMatrixAt(railIdx++, _dummy.matrix);
       }
 
-      // Sheikh Zayed Road + Median Jersey Barrier
       _dummy.position.set(rx + cosY * 28, 0.06, rz - sinY * 28);
       _dummy.rotation.set(0, _poseNext.yaw, 0);
       _dummy.scale.set(1, 1, 1);
@@ -1081,6 +1460,15 @@ export class DubaiMetroEngine {
       _dummy.updateMatrix();
       this.highwayMedianInst.setMatrixAt(i, _dummy.matrix);
 
+      // Landscaped green parks flanking Sheikh Zayed Road
+      for (const gx of [-12, 56]) {
+        _dummy.position.set(rx + cosY * gx, 0.02, rz - sinY * gx);
+        _dummy.rotation.set(0, _poseNext.yaw, 0);
+        _dummy.scale.set(1, 1, 1);
+        _dummy.updateMatrix();
+        this.greenStripInst.setMatrixAt(greenIdx++, _dummy.matrix);
+      }
+
       for (const lx of [28, 5.5]) {
         _dummy.position.set(rx + cosY * lx, 5.25, rz - sinY * lx);
         _dummy.rotation.set(0, _poseNext.yaw, 0);
@@ -1089,7 +1477,7 @@ export class DubaiMetroEngine {
         this.streetLampInst.setMatrixAt(lampIdx++, _dummy.matrix);
       }
 
-      for (const px of [-14, 56]) {
+      for (const px of [-13, 56]) {
         const jx = rx + cosY * px;
         const jz = rz - sinY * px;
         _dummy.position.set(jx, 3.75, jz);
@@ -1113,10 +1501,41 @@ export class DubaiMetroEngine {
     this.steelRailInst.instanceMatrix.needsUpdate = true;
     this.highwayInst.instanceMatrix.needsUpdate = true;
     this.highwayMedianInst.instanceMatrix.needsUpdate = true;
+    this.greenStripInst.instanceMatrix.needsUpdate = true;
     this.streetLampInst.instanceMatrix.needsUpdate = true;
     this.palmTrunkInst.instanceMatrix.needsUpdate = true;
     this.palmCrownInst.instanceMatrix.needsUpdate = true;
 
+    // Trackside ATP Block Signals every 150m
+    const sigBase = Math.floor((this.distanceM - 150) / 150);
+    for (let i = 0; i < 16; i++) {
+      const sigS = (sigBase + i) * 150;
+      sampleTrackPose(sigS, _poseNext);
+      const rx = _poseNext.x - ox;
+      const rz = _poseNext.z - oz;
+      const cosY = Math.cos(_poseNext.yaw);
+      const sinY = Math.sin(_poseNext.yaw);
+
+      _dummy.position.set(rx - cosY * 2.1, _poseNext.y + 1.8, rz + sinY * 2.1);
+      _dummy.rotation.set(0, _poseNext.yaw, 0);
+      _dummy.scale.set(1, 1, 1);
+      _dummy.updateMatrix();
+      this.signalMastInst.setMatrixAt(i, _dummy.matrix);
+
+      _dummy.position.set(rx - cosY * 2.1, _poseNext.y + 3.45, rz + sinY * 2.1);
+      _dummy.updateMatrix();
+      this.signalLampInst.setMatrixAt(i, _dummy.matrix);
+
+      const nextSt = DUBAI_STATIONS[this.nextStationIdx];
+      const nearStop = nextSt && Math.abs(nextSt.distanceM - sigS) < 180;
+      _color.setHex(nearStop ? 0xf59e0b : 0x10b981);
+      this.signalLampInst.setColorAt(i, _color);
+    }
+    this.signalMastInst.instanceMatrix.needsUpdate = true;
+    this.signalLampInst.instanceMatrix.needsUpdate = true;
+    if (this.signalLampInst.instanceColor) this.signalLampInst.instanceColor.needsUpdate = true;
+
+    // Composite Highway Vehicles (Chassis + Cabin + Head/Taillights)
     for (let i = 0; i < this.trafficVehicles.length; i++) {
       const v = this.trafficVehicles[i];
       v.offsetS += v.speedMs * dt * this.simSpeed;
@@ -1127,24 +1546,58 @@ export class DubaiMetroEngine {
       sampleTrackPose(worldS, _poseNext);
       const cosY = Math.cos(_poseNext.yaw);
       const sinY = Math.sin(_poseNext.yaw);
+      const cx = _poseNext.x - ox + cosY * v.laneX;
+      const cz = _poseNext.z - oz - sinY * v.laneX;
+      const fwdX = -Math.sin(_poseNext.yaw);
+      const fwdZ = -Math.cos(_poseNext.yaw);
+      const dirSign = v.speedMs < 0 ? -1 : 1;
 
-      _dummy.position.set(
-        _poseNext.x - ox + cosY * v.laneX,
-        0.78,
-        _poseNext.z - oz - sinY * v.laneX
-      );
-      _dummy.rotation.set(0, _poseNext.yaw, 0);
-      _dummy.scale.set(1, 1, 1);
-      _dummy.updateMatrix();
-      this.trafficInst.setMatrixAt(i, _dummy.matrix);
+      if (v.isBus) {
+        _dummy.position.set(cx, 1.45, cz);
+        _dummy.rotation.set(0, _poseNext.yaw, 0);
+        _dummy.scale.set(2.4, 2.5, 9.6);
+        _dummy.updateMatrix();
+        this.trafficBodyInst.setMatrixAt(i, _dummy.matrix);
+
+        _dummy.position.set(cx, 2.1, cz);
+        _dummy.scale.set(2.44, 0.9, 8.8);
+        _dummy.updateMatrix();
+        this.trafficCabinInst.setMatrixAt(i, _dummy.matrix);
+
+        _dummy.position.set(cx + fwdX * 4.82 * dirSign, 0.9, cz + fwdZ * 4.82 * dirSign);
+        _dummy.scale.set(2.0, 0.28, 0.15);
+        _dummy.updateMatrix();
+        this.trafficLightsInst.setMatrixAt(i, _dummy.matrix);
+      } else {
+        _dummy.position.set(cx, 0.62, cz);
+        _dummy.rotation.set(0, _poseNext.yaw, 0);
+        _dummy.scale.set(1.95, 0.78, 4.4);
+        _dummy.updateMatrix();
+        this.trafficBodyInst.setMatrixAt(i, _dummy.matrix);
+
+        _dummy.position.set(cx - fwdX * 0.2 * dirSign, 1.24, cz - fwdZ * 0.2 * dirSign);
+        _dummy.scale.set(1.65, 0.6, 2.35);
+        _dummy.updateMatrix();
+        this.trafficCabinInst.setMatrixAt(i, _dummy.matrix);
+
+        _dummy.position.set(cx + fwdX * 2.22 * dirSign, 0.66, cz + fwdZ * 2.22 * dirSign);
+        _dummy.scale.set(1.55, 0.18, 0.12);
+        _dummy.updateMatrix();
+        this.trafficLightsInst.setMatrixAt(i, _dummy.matrix);
+      }
     }
-    this.trafficInst.instanceMatrix.needsUpdate = true;
+    this.trafficBodyInst.instanceMatrix.needsUpdate = true;
+    this.trafficCabinInst.instanceMatrix.needsUpdate = true;
+    this.trafficLightsInst.instanceMatrix.needsUpdate = true;
 
+    // Composite Dubai Skyscrapers (Main Shaft + Stepped Crown + Rooftop Spire)
     const cellSize = 45;
     const baseCell = Math.floor((this.distanceM - 450) / cellSize);
     let cIdx = 0;
     let gIdx = 0;
     let dIdx = 0;
+    let crownIdx = 0;
+    let spireIdx = 0;
 
     for (let cell = 0; cell < 39; cell++) {
       const worldCell = baseCell + cell;
@@ -1174,13 +1627,12 @@ export class DubaiMetroEngine {
         const bWidth = 18 + r2 * 22;
         const bDepth = 18 + r3 * 22;
         const bHeight = (26 + Math.pow(r1, 1.4) * 115) * heightBoost;
+        const bx = _poseNext.x - ox + cosY * lateral;
+        const bz = _poseNext.z - oz - sinY * lateral;
+        const rotY = _poseNext.yaw + (r2 - 0.5) * 0.12;
 
-        _dummy.position.set(
-          _poseNext.x - ox + cosY * lateral,
-          bHeight * 0.5,
-          _poseNext.z - oz - sinY * lateral
-        );
-        _dummy.rotation.set(0, _poseNext.yaw + (r2 - 0.5) * 0.12, 0);
+        _dummy.position.set(bx, bHeight * 0.5, bz);
+        _dummy.rotation.set(0, rotY, 0);
         _dummy.scale.set(bWidth, bHeight, bDepth);
         _dummy.updateMatrix();
 
@@ -1192,6 +1644,23 @@ export class DubaiMetroEngine {
         } else if (dIdx < 52) {
           this.buildingDarkInst.setMatrixAt(dIdx++, _dummy.matrix);
         }
+
+        // Architectural Stepped Penthouse Crown + Spire on taller towers
+        if (crownIdx < 156) {
+          const crownH = 5 + r3 * 9;
+          _dummy.position.set(bx, bHeight + crownH * 0.5, bz);
+          _dummy.scale.set(bWidth * 0.65, crownH, bDepth * 0.65);
+          _dummy.updateMatrix();
+          this.buildingCrownInst.setMatrixAt(crownIdx++, _dummy.matrix);
+
+          if (bHeight > 70 && spireIdx < 156) {
+            const spH = 12 + r1 * 18;
+            _dummy.position.set(bx, bHeight + crownH + spH * 0.5, bz);
+            _dummy.scale.set(1, spH, 1);
+            _dummy.updateMatrix();
+            this.buildingSpireInst.setMatrixAt(spireIdx++, _dummy.matrix);
+          }
+        }
       }
     }
     _dummy.scale.set(0, 0, 0);
@@ -1199,10 +1668,16 @@ export class DubaiMetroEngine {
     while (cIdx < 52) this.buildingCyanInst.setMatrixAt(cIdx++, _dummy.matrix);
     while (gIdx < 52) this.buildingGoldInst.setMatrixAt(gIdx++, _dummy.matrix);
     while (dIdx < 52) this.buildingDarkInst.setMatrixAt(dIdx++, _dummy.matrix);
+    while (crownIdx < 156) this.buildingCrownInst.setMatrixAt(crownIdx++, _dummy.matrix);
+    while (spireIdx < 156) this.buildingSpireInst.setMatrixAt(spireIdx++, _dummy.matrix);
+
     this.buildingCyanInst.instanceMatrix.needsUpdate = true;
     this.buildingGoldInst.instanceMatrix.needsUpdate = true;
     this.buildingDarkInst.instanceMatrix.needsUpdate = true;
+    this.buildingCrownInst.instanceMatrix.needsUpdate = true;
+    this.buildingSpireInst.instanceMatrix.needsUpdate = true;
 
+    // Stations, Platform LEDs & Articulated Animated People
     const timeSec = performance.now() * 0.001;
     for (const rig of this.stationRigs) {
       const relS = rig.station.distanceM - this.distanceM;
@@ -1218,12 +1693,37 @@ export class DubaiMetroEngine {
           leaf.position.z = (leaf.userData.baseZ as number) + psdSlide;
         }
 
+        // Edge LED strip turns emerald green when doors open
+        if (isActiveStop && this.doorOpenAmount > 0.25) {
+          rig.edgeLedMat.color.setHex(0x10b981);
+          rig.edgeLedMat.emissive.setHex(0x10b981);
+        } else {
+          rig.edgeLedMat.color.setHex(0xf59e0b);
+          rig.edgeLedMat.emissive.setHex(0xf59e0b);
+        }
+
         for (const p of rig.passengers) {
-          if (isActiveStop && this.doorOpenAmount > 0.5 && p.boarding) {
-            const walk = Math.sin(timeSec * 3.2 + p.phase) * 0.5 + 0.5;
-            p.mesh.position.x = THREE.MathUtils.lerp(p.baseX, -1.95, walk * 0.65);
+          if (isActiveStop && this.doorOpenAmount > 0.45 && p.role === 'board') {
+            const walk = Math.sin(timeSec * 3.4 + p.phase) * 0.5 + 0.5;
+            p.mesh.position.x = THREE.MathUtils.lerp(p.baseX, -1.95, walk * 0.72);
+            const stride = Math.sin(timeSec * 8 + p.phase) * 0.45;
+            p.legL.rotation.x = stride;
+            p.legR.rotation.x = -stride;
+          } else if (isActiveStop && this.doorOpenAmount > 0.45 && p.role === 'alight') {
+            const walk = Math.sin(timeSec * 2.8 + p.phase) * 0.5 + 0.5;
+            p.mesh.position.x = THREE.MathUtils.lerp(-2.0, -5.2, walk * 0.75);
+            const stride = Math.sin(timeSec * 7 + p.phase) * 0.4;
+            p.legL.rotation.x = stride;
+            p.legR.rotation.x = -stride;
+          } else if (p.role === 'stroll') {
+            p.mesh.position.z = p.baseZ + Math.sin(timeSec * 1.1 + p.phase) * 2.2;
+            const stride = Math.sin(timeSec * 4.5 + p.phase) * 0.32;
+            p.legL.rotation.x = stride;
+            p.legR.rotation.x = -stride;
           } else {
-            p.mesh.position.x = p.baseX + Math.sin(timeSec * 0.9 + p.phase) * 0.08;
+            p.mesh.position.x = p.baseX + Math.sin(timeSec * 0.8 + p.phase) * 0.06;
+            p.legL.rotation.x = 0;
+            p.legR.rotation.x = 0;
           }
         }
       } else {
@@ -1256,9 +1756,8 @@ export class DubaiMetroEngine {
     const rightZ = -Math.sin(_pose.yaw);
 
     if (this.cameraMode === 'cab') {
-      // Driver eye position inside the 3D cockpit overlooking the DMI desk, lever & windshield
       const eyeFwd = 0.08;
-      const eyeUp = _pose.y + 2.95;
+      const eyeUp = _pose.y + 2.95 + vib;
       _camTargetPos.set(fwdX * eyeFwd, eyeUp, fwdZ * eyeFwd);
       _camLookAt.set(
         fwdX * 85,
@@ -1327,6 +1826,11 @@ export class DubaiMetroEngine {
       }
     }
 
+    const wiperActive =
+      this.wiperManual ||
+      this.activeWeather === 'sandstorm' ||
+      this.activeWeather === 'night-fog';
+
     this.onTelemetry({
       distanceM: this.distanceM,
       speedKmh,
@@ -1355,6 +1859,11 @@ export class DubaiMetroEngine {
       comfortPct: Math.round(this.comfortPct),
       overspeeding: speedKmh > limitKmh + 4,
       autopilot: this.autopilot,
+      speedLockEnabled: this.speedLockEnabled,
+      speedLockKmh: this.speedLockKmh,
+      weatherMode: this.weatherMode,
+      activeWeather: this.activeWeather,
+      wiperActive,
       simSpeed: this.simSpeed,
       routeComplete: this.routeComplete,
       elapsedSimSec: this.elapsedSimSec,
@@ -1389,6 +1898,7 @@ export class DubaiMetroEngine {
       this.lastTimeMs = now;
       const dt = Math.min(rawDt, 0.08);
 
+      this.updateWeather(dt);
       this.updatePhysics(dt);
       this.updateSceneTransforms(dt);
       this.emitTelemetry(false);
@@ -1423,12 +1933,14 @@ export class DubaiMetroEngine {
     this.audio.dispose();
     this.textures.dispose();
     this.trainRig.dmi?.dispose();
+    this.trainRig.aux?.dispose();
     for (const r of this.stationRigs) {
       r.signTex.dispose();
+      r.depTex.dispose();
     }
 
     this.scene.traverse((obj) => {
-      if ((obj as THREE.Mesh).isMesh) {
+      if ((obj as THREE.Mesh).isMesh || (obj as THREE.Points).isPoints) {
         const mesh = obj as THREE.Mesh;
         mesh.geometry?.dispose();
         if (Array.isArray(mesh.material)) {
